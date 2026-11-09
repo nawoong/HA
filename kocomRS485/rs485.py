@@ -37,7 +37,7 @@ try:
 except ImportError:  # 소켓만 쓰는 경우 pyserial 없어도 동작
     serial = None
 
-SW_VERSION = 'RS485 Compilation 1.2.3'
+SW_VERSION = 'RS485 Compilation 1.2.4'
 
 ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
 OPTIONS_FILE = '/data/options.json'
@@ -60,9 +60,14 @@ COMMAND_NAMES = {'3a': '조회', '00': '상태', '01': 'on', '02': 'off'}
 TYPE_NAMES = {'30b': 'send', '30d': 'ack'}
 EMPTY_VALUE = '0' * 16
 
-THERMO_MODES = ('off', 'heat', 'fan_only')         # fan_only = 외출
+# 내부 모드: off / heat / away(외출). HA에는 off·heat 모드 + away 프리셋으로 보인다.
 # off는 '0001': 월패드에서 직접 껐을 때 온도조절기가 보고한 값. '0100'은 ACK만 오고 꺼지지 않음
-THERMO_MODE_CODE = {'heat': '1100', 'off': '0001', 'fan_only': '1101'}
+THERMO_MODE_CODE = {'heat': '1100', 'off': '0001', 'away': '1101'}
+HA_HVAC_MODES = ('off', 'heat')
+HA_PRESET_AWAY = 'away'
+HA_PRESET_NONE = 'none'
+THERMO_MIN_TEMP = 10
+THERMO_MAX_TEMP = 30
 
 FAN_SPEED = {'4': 'low', '8': 'medium', 'c': 'high', '0': 'off'}
 FAN_SPEED_CODE = {v: k for k, v in FAN_SPEED.items()}
@@ -176,7 +181,7 @@ def parse_thermostat(value, prev_target, init_temp):
     keep_target = int(prev_target) if prev_target else init_temp
     result = {'current_temp': int(value[8:10], 16)}
     if heating and away:
-        result['mode'] = 'fan_only'
+        result['mode'] = 'away'
         result['target_temp'] = keep_target
     elif heating:
         result['mode'] = 'heat'
@@ -185,6 +190,13 @@ def parse_thermostat(value, prev_target, init_temp):
         result['mode'] = 'off'
         result['target_temp'] = keep_target
     return result
+
+
+def ha_thermostat_state(mode, target_temp, current_temp):
+    '''내부 모드(off/heat/away) -> HA climate 상태. 외출은 난방 모드 + away 프리셋.'''
+    return {'mode': 'off' if mode == 'off' else 'heat',
+            'preset': HA_PRESET_AWAY if mode == 'away' else HA_PRESET_NONE,
+            'target_temp': target_temp, 'current_temp': current_temp}
 
 ###############################################################################
 # 연결
@@ -432,7 +444,7 @@ class Kocom:
                 # 월패드에서 직접 바꾼 값도 따라감 -> 이후 HA 명령이 옛 값을 보내지 않도록
                 unit.desired.update(mode=value['mode'], target_temp=value['target_temp'])
         logger.info('[From kocom]thermostat/{}/state = {}'.format(unit.name, value))
-        self.publish_state(unit, value)
+        self.publish_state(unit, ha_thermostat_state(value['mode'], value['target_temp'], value['current_temp']))
 
     # ---------------------------------------------------------------- 송신
     def scan_loop(self):
@@ -557,10 +569,14 @@ class Kocom:
                 'temp_stat_tpl': '{{ value_json.target_temp }}',
                 'curr_temp_t': base + '/state',
                 'curr_temp_tpl': '{{ value_json.current_temp }}',
-                'min_temp': 5,
-                'max_temp': 40,
+                'pr_mode_cmd_t': base + '/preset',
+                'pr_mode_stat_t': base + '/state',
+                'pr_mode_val_tpl': '{{ value_json.preset }}',
+                'pr_modes': [HA_PRESET_AWAY],
+                'min_temp': THERMO_MIN_TEMP,
+                'max_temp': THERMO_MAX_TEMP,
                 'temp_step': 1,
-                'modes': list(THERMO_MODES),
+                'modes': list(HA_HVAC_MODES),
                 'uniq_id': '{}_{}_thermostat'.format(ENTITY_PREFIX, room),
                 'device': self.ha_device(room),
             }))
@@ -569,7 +585,7 @@ class Kocom:
     def discovery(self, remove=False):
         subscribe = [(BRIDGE_TOPIC + '/#', 0), (HA_STATUS_TOPIC, 0)]
         for topic, payload in self.discovery_configs():
-            for key in ('cmd_t', 'spd_cmd_t', 'mode_cmd_t', 'temp_cmd_t'):
+            for key in ('cmd_t', 'spd_cmd_t', 'mode_cmd_t', 'temp_cmd_t', 'pr_mode_cmd_t'):
                 if key in payload:
                     subscribe.append((payload[key], 0))
             self.mqtt.publish(topic, '' if remove else json.dumps(payload))
@@ -578,7 +594,8 @@ class Kocom:
     def republish_states(self):
         for unit in self.thermostats.values():
             if unit.scan_tick:
-                self.publish_state(unit, {k: unit.state[k] for k in ('mode', 'target_temp', 'current_temp')})
+                s = unit.state
+                self.publish_state(unit, ha_thermostat_state(s['mode'], s['target_temp'], s['current_temp']))
         if self.fan:
             self.publish_state(self.fan, dict(self.fan.desired))
 
@@ -608,19 +625,26 @@ class Kocom:
 
     def on_climate(self, room, command, payload):
         unit = self.thermostats.get(room)
-        if unit is None or command not in ('mode', 'target_temp'):
+        if unit is None or command not in ('mode', 'target_temp', 'preset'):
             return
         with self.lock:
             if command == 'target_temp':
                 unit.request(target_temp=int(float(payload)), mode='heat')
-            elif payload in THERMO_MODES:
+            elif command == 'mode' and payload in HA_HVAC_MODES:
                 unit.request(mode=payload)
+            elif command == 'mode' and payload == 'fan_only':  # 1.2.3 이하의 외출 모드 (기존 자동화 호환)
+                unit.request(mode='away')
+            elif command == 'preset' and payload == HA_PRESET_AWAY:
+                unit.request(mode='away')
+            elif command == 'preset' and payload == HA_PRESET_NONE:
+                if unit.desired['mode'] == 'away':  # 외출 해제 -> 난방. 꺼져 있으면 그대로
+                    unit.request(mode='heat')
             else:
-                logger.warning('[From HA]지원하지 않는 난방 모드: {}'.format(payload))
+                logger.warning('[From HA]지원하지 않는 난방 명령: {} = {}'.format(command, payload))
                 return
-            ha = {'mode': unit.desired['mode'], 'target_temp': unit.desired['target_temp'],
-                  'current_temp': unit.state['current_temp']}
-        logger.info('[From HA]thermostat/{}/set = [mode={}, target_temp={}]'.format(room, ha['mode'], ha['target_temp']))
+            d = unit.desired
+            ha = ha_thermostat_state(d['mode'], d['target_temp'], unit.state['current_temp'])
+        logger.info('[From HA]thermostat/{}/set = [mode={}, target_temp={}]'.format(room, d['mode'], d['target_temp']))
         self.publish_state(unit, ha)  # 월패드 응답을 기다리지 않고 HA에 먼저 반영
 
     def on_fan(self, command, payload):
