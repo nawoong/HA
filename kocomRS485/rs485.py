@@ -37,7 +37,7 @@ try:
 except ImportError:  # 소켓만 쓰는 경우 pyserial 없어도 동작
     serial = None
 
-SW_VERSION = 'RS485 Compilation 1.2.0'
+SW_VERSION = 'RS485 Compilation 1.2.1'
 
 ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
 OPTIONS_FILE = '/data/options.json'
@@ -61,7 +61,8 @@ TYPE_NAMES = {'30b': 'send', '30d': 'ack'}
 EMPTY_VALUE = '0' * 16
 
 THERMO_MODES = ('off', 'heat', 'fan_only')         # fan_only = 외출
-THERMO_MODE_CODE = {'heat': '1100', 'off': '0100', 'fan_only': '1101'}
+# off는 '0001': 월패드에서 직접 껐을 때 온도조절기가 보고한 값. '0100'은 ACK만 오고 꺼지지 않음
+THERMO_MODE_CODE = {'heat': '1100', 'off': '0001', 'fan_only': '1101'}
 
 FAN_SPEED = {'4': 'low', '8': 'medium', 'c': 'high', '0': 'off'}
 FAN_SPEED_CODE = {v: k for k, v in FAN_SPEED.items()}
