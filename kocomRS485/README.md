@@ -5,7 +5,13 @@
 ## About
 랜이님이 만든 코콤 월패드 프로그램을 애드온으로 만든 것입니다.
 
-## Version : 1.1.1
+## Version : 1.2.0
+- 난방(thermostat), 환기(fan) 전용으로 정리. 조명/콘센트/가스/엘리베이터, 그렉스 제거
+- 소켓/시리얼 연결이 끊기면 자동 재연결, 수신 스레드가 예외로 죽지 않도록 수정
+- HA 재시작(homeassistant/status = online) 시 엔티티 재등록 및 상태 재발행
+- 로그를 애드온 로그 화면에도 출력
+
+### Version : 1.1.1
 - auto_uart deprecated. change to uart config
 - alpine linux images를 python3 이미지로 교체
 - CPU 최적화 및 딜레이 수정
@@ -23,68 +29,35 @@
 
 만일 rs485.py 파일을 수정하시려면 한번 실행한 후 애드온을 Stop 하시고 share/kocom/ 폴더에 있는 파일을 알맞게 수정하신 다음 애드온을 Start 하시면 이후부터는 수정된 파일을 적용합니다.
 
+> **업데이트 주의**: 애드온은 처음 실행할 때만 `rs485.py`를 `share/kocom/`에 복사합니다.
+> 새 버전의 `rs485.py`를 적용하려면 애드온을 Stop 한 뒤 `share/kocom/rs485.py`를 지우고(또는 새 파일로 덮어쓰고) Start 하세요.
+
 ## Configuration
 
 Add-on configuration:
 
 ```yaml
 RS485:
-  type: Serial
+  type: Socket
 Socket:
   server: 192.168.x.x
   port: 8899
-SocketDevice:
-  device: kocom
 Serial:
   port1: /dev/ttyUSB0
-SerialDevice:
-  port1: kocom
 MQTT:
   anonymous: false
   server: 192.168.x.x
   username: id
   password: pw
 Wallpad:
-  light: false
-  plug: false
-  thermostat: false
-  fan: false
-  gas: false
-  elevator: false
+  thermostat: true
+  fan: true
 Advanced:
   INIT_TEMP: 22
   SCAN_INTERVAL: 300
   SCANNING_INTERVAL: 0.8
   DEFAULT_SPEED: medium
   LOGLEVEL: info
-KOCOM_LIGHT_SIZE:
-  - name: livingroom
-    number: 3
-  - name: bedroom
-    number: 2
-  - name: room1
-    number: 2
-  - name: room2
-    number: 2
-  - name: kitchen
-    number: 3
-KOCOM_PLUG_SIZE:
-  - name: livingroom
-    number: 3
-  - name: bedroom
-    number: 2
-  - name: room1
-    number: 2
-  - name: room2
-    number: 2
-  - name: kitchen
-    number: 3
-KOCOM_ROOM:
-  - livingroom
-  - bedroom
-  - room1
-  - room2
-  - kitchen
 KOCOM_ROOM_THERMOSTAT:
   - livingroom
   - bedroom
@@ -94,95 +67,40 @@ KOCOM_ROOM_THERMOSTAT:
 
 ### Option: `RS485` (required)
 ```yaml
-type: Serial                    // Serial 혹은 Socket
+type: Socket                    // Serial 혹은 Socket
 ```
-### Option: `Socket` (required)
+### Option: `Socket`
 ```yaml
-server: 192.168.x.x           // Socket 쓸 경우 socket IP주소
-port: 8899                        // Socket 쓸 경우 socket PORT번호
+server: 192.168.x.x           // Socket 쓸 경우 RS485-이더넷/WiFi 변환기 IP주소
+port: 8899                    // Socket 쓸 경우 PORT번호
 ```
-### Option: `SocketDevice` (required)
+### Option: `Serial`
 ```yaml
-device: kocom               // socket 쓸 경우 월패드 이름{{장치이름}}
+port1: /dev/ttyUSB0           // Serial 쓸 경우 장치경로. 재연결에 대비해 /dev/serial/by-id/... 경로 권장
 ```
-### Option: `Serial` (required)
-```yaml
-port1: /dev/ttyUSB0        // serial 쓸 경우 (월패드 혹은 그렉스)의 장치경로 작성
-port2: /dev/ttyUSB1        // serial 쓸 경우 (월패드 혹은 그렉스)의 장치경로 작성
-port3: /dev/ttyUSB2        // serial 쓸 경우 (월패드 혹은 그렉스)의 장치경로 작성
-```
-port2, port3는 추가,삭제 가능
-
-### Option `SerialDevice` (required)
-```yaml
-port1: kocom               // serial 쓸 경우 (월패드 이름 혹은 그렉스 이름) 작성{{장치이름}}
-port2: grex_ventilator     // serial 쓸 경우 (월패드 이름 혹은 그렉스 이름) 작성{{장치이름}}
-port3: grex_controller     // serial 쓸 경우 (월패드 이름 혹은 그렉스 이름) 작성{{장치이름}}
-```
-port2, port3는 추가,삭제 가능
-
-{{장치이름}}
-kocom = 코콤월패드
-grex_ventilator = 그렉스 환기장치
-grex_controller = 그렉스 환기장치의 리모콘(환기모드, 정지 등)
 
 ### Option `MQTT` (required)
 ```yaml
-anonymous: false           // MQTT 설정
+anonymous: false             // MQTT 설정
 server: 192.168.x.xx         // MQTT 서버
 username: id                 // MQTT ID
-password: pw                // MQTT PW
+password: pw                 // MQTT PW
 ```
 
 ### Option `Wallpad` (required)
 ```yaml
-light: true                    // 조명 
-plug: true                    // 플러그 
-thermostat: true            // 난방 
-fan: true                     // 환기팬 
-gas: true                     // 가스 
-elevator: true               // 엘레베이터 
+thermostat: true             // 난방
+fan: true                    // 환기팬
 ```
 
 ### Option `Advanced` (required)
 ```yaml
 INIT_TEMP: 22           // 보일러 초기값
 SCAN_INTERVAL: 300      // 월패드의 상태값 조회 간격
-SCANNING_INTERVAL: 0.5  // 상태값 조회 시 패킷전송 간격
-DEFAULT_SPEED: medium   //환풍기 초기속도 low, medium, high
-LOGLEVEL: info , debug, info, warn 중에 하나
+SCANNING_INTERVAL: 0.8  // 상태값 조회 시 패킷전송 간격
+DEFAULT_SPEED: medium   // 환풍기 초기속도 low, medium, high
+LOGLEVEL: info          // debug, info, warn 중에 하나
 ```
-### Option `KOCOM_LIGHT_SIZE` (optional)
-name은 방이름, number는 조명 개수. 본인의 집 수량만큼 추가 가능.
-
-```yaml
-KOCOM_LIGHT_SIZE:
-  - name: livingroom
-    number: 3
-  - name: bedroom
-    number: 2
-```
-### Option `KOCOM_PLUG_SIZE` (optional)
-name은 방이름, number는 플러그 개수. 본인의 집 수량만큼 추가 가능.
-
-```yaml
-KOCOM_PLUG_SIZE:
-  - name: livingroom
-    number: 3
-  - name: bedroom
-    number: 2
-```
-### Option `KOCOM_ROOM` (optional)
-방이름을 배열로 개수만큼 추가
-
-```yaml
-KOCOM_ROOM:
-  - livingroom
-  - bedroom
-  - room1
-```
-방 패킷에 따른 방이름 패킷 이름은 00부터 01, 02로 시작하는 순서와 방이름이 매칭되어야 함
-월패드에서 장치를 작동하며 방이름(livingroom, bedroom, room1  등)을 확인하여 본인의 상황에 맞게 바꾸세요
 
 ### Option `KOCOM_ROOM_THERMOSTAT` (optional)
 ```yaml
@@ -191,9 +109,12 @@ KOCOM_ROOM_THERMOSTAT:
   - bedroom
   - room1
 ```
-조명/콘센트와 난방의 방패킷이 달라서 두개로 나뉘어있습니다.
-방 패킷에 따른 방이름 패킷 이름은 00부터 01, 02로 시작하는 순서와 방이름이 매칭되어야 함
-월패드에서 장치를 작동하며 방이름(livingroom, bedroom, room1  등)을 확인하여 본인의 상황에 맞게 바꾸세요
+난방 방 패킷 00, 01, 02 ... 순서와 방이름이 매칭되어야 합니다.
+월패드에서 난방을 작동하며 방이름(livingroom, bedroom, room1 등)을 확인하여 본인의 상황에 맞게 바꾸세요.
+
+### 환기팬 전용 패킷
+이 설치환경의 환기장치는 코콤 표준 환기 패킷으로 동작하지 않아 `rs485.py`의 `FAN_RAW_PACKETS`에 정의된
+전용 패킷(on: 중간 속도, off)을 보냅니다. 응답을 확인할 수 없으므로 명령마다 5회 반복 전송합니다.
 
 ## Support
 

@@ -1,1241 +1,693 @@
 # -*- coding: utf-8 -*-
 '''
-python -m pip install pyserial
-python -m pip install paho-mqtt
+Kocom 월패드 RS485 <-> Home Assistant(MQTT) 브리지 - 난방(thermostat), 환기(fan) 전용
+
+  python -m pip install pyserial paho-mqtt
+
+구성
+  load_config() : /data/options.json(HA 애드온) 또는 rs485.conf(단독 실행) 읽기
+  Transport     : 소켓/시리얼 연결. 끊기면 RECONNECT_SEC 후 자동 재연결
+  Unit          : 난방 방 하나 또는 환기장치 하나의 상태와 "보내야 할 명령"
+  Kocom         : 패킷 수신/해석(read_loop), 조회/명령 전송(scan_loop), MQTT/HA 연동
+
+코콤 패킷 (21 bytes = hex 42자)
+  [0:4]   aa55          헤더
+  [4:7]   30b / 30d     타입 send / ack
+  [10:14] 장치2+방2     send: 목적지,  ack: 출발지
+  [14:18] 장치2+방2     send: 출발지,  ack: 목적지
+  [18:20] 명령          3a=조회, 00=상태(설정), 01=on, 02=off
+  [20:36] 값 8 bytes
+  [36:38] 체크섬        (앞 18 bytes 합 + 1) % 256
+  [38:42] 0d0d
 '''
-import os
-import os.path
-import serial
-import socket
-import time
-import platform
-import threading
+import configparser
 import json
 import logging
-import logging.config
 import logging.handlers
-import configparser
+import os
+import socket
+import threading
+import time
+from collections import namedtuple
+
 import paho.mqtt.client as mqtt
-from collections import OrderedDict
 
-# Version
-SW_VERSION = 'RS485 Compilation 1.0.3b'
-# Log Level
-CONF_LOGLEVEL = 'debug' # debug, info, warn
+try:
+    import serial
+except ImportError:  # 소켓만 쓰는 경우 pyserial 없어도 동작
+    serial = None
 
-###############################################################################################################
-################################################## K O C O M ##################################################
-# 본인에 맞게 수정하세요
+SW_VERSION = 'RS485 Compilation 1.2.0'
 
-# 보일러 초기값
-INIT_TEMP = 22
-# 환풍기 초기속도 ['low', 'medium', 'high']
-DEFAULT_SPEED = 'medium'
-# 조명 / 플러그 갯수
-KOCOM_LIGHT_SIZE            = {'livingroom': 3, 'bedroom': 2, 'room1': 2, 'room2': 2, 'kitchen': 3}
-KOCOM_PLUG_SIZE             = {'livingroom': 2, 'bedroom': 2, 'room1': 2, 'room2': 2, 'kitchen': 2}
+ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
+OPTIONS_FILE = '/data/options.json'
+CONF_PATH = os.path.join(ROOT_DIR, 'rs485.conf')
+LOG_PATH = os.path.join(ROOT_DIR, 'log', 'rs485.log')
 
-# 방 패킷에 따른 방이름 (패킷1: 방이름1, 패킷2: 방이름2 . . .)
-# 월패드에서 장치를 작동하며 방이름(livingroom, bedroom, room1, room2, kitchen 등)을 확인하여 본인의 상황에 맞게 바꾸세요
-# 조명/콘센트와 난방의 방패킷이 달라서 두개로 나뉘어있습니다.
-KOCOM_ROOM                  = {'00': 'livingroom', '01': 'bedroom', '02': 'room2', '03': 'room1', '04': 'kitchen'}
-KOCOM_ROOM_THERMOSTAT       = {'00': 'livingroom', '01': 'bedroom', '02': 'room1', '03': 'room2'}
+logger = logging.getLogger('RS485')
 
-# TIME 변수(초)
-SCAN_INTERVAL = 300         # 월패드의 상태값 조회 간격
-SCANNING_INTERVAL = 0.8     # 상태값 조회 시 패킷전송 간격
-####################### Start Here by Zooil ###########################
-option_file = '/data/options.json'                                                                                             
-if os.path.isfile(option_file):                                                                                                
-    with open(option_file) as json_file:                                                                                   
-        json_data = json.load(json_file)                                                                               
-        INIT_TEMP = json_data['Advanced']['INIT_TEMP']                                                                 
-        SCAN_INTERVAL = json_data['Advanced']['SCAN_INTERVAL']                                                         
-        SCANNING_INTERVAL = json_data['Advanced']['SCANNING_INTERVAL'] 
-        DEFAULT_SPEED = json_data['Advanced']['DEFAULT_SPEED'] 
-        CONF_LOGLEVEL = json_data['Advanced']['LOGLEVEL']
-        KOCOM_LIGHT_SIZE = {} 
-        dict_data = json_data['KOCOM_LIGHT_SIZE']                                                               
-        for i in dict_data:
-            KOCOM_LIGHT_SIZE[i['name']] = i['number'] 
-        KOCOM_PLUG_SIZE = {} 
-        dict_data = json_data['KOCOM_PLUG_SIZE']                                                               
-        for i in dict_data:
-            KOCOM_PLUG_SIZE[i['name']] = i['number'] 
-        num = 0
-        KOCOM_ROOM = {}
-        list_data = json_data['KOCOM_ROOM']                                                                           
-        for i in list_data:
-            if num < 10:
-                num_key = "0%d" % (num)
-            else:           
-                num_key = "%d" % (num)
-            KOCOM_ROOM[num_key] = i
-            num += 1
-        num = 0
-        KOCOM_ROOM_THERMOSTAT = {}
-        list_data = json_data['KOCOM_ROOM_THERMOSTAT']                                                                           
-        for i in list_data:
-            if num < 10:
-                num_key = "0%d" % (num)
-            else:
-                num_key = "%d" % (num)
-            KOCOM_ROOM_THERMOSTAT[num_key] = i
-            num += 1         
-####################### End Here by Zooil ########################### 
-###############################################################################################################
+###############################################################################
+# 프로토콜 상수
+###############################################################################
+DEV_WALLPAD = '01'
+DEV_THERMOSTAT = '36'
+DEV_FAN = '48'
+DEVICE_NAMES = {'01': 'wallpad', '0e': 'light', '36': 'thermostat', '3b': 'plug',
+                '44': 'elevator', '2c': 'gas', '48': 'fan'}          # 로그 표시용
+CMD_QUERY = '3a'
+CMD_STATE = '00'
+COMMAND_NAMES = {'3a': '조회', '00': '상태', '01': 'on', '02': 'off'}
+TYPE_NAMES = {'30b': 'send', '30d': 'ack'}
+EMPTY_VALUE = '0' * 16
 
-###############################################################################################################
-################################################# 수 정 금 지 ##################################################
-################################################# 수 정 금 지 ##################################################
-################################################# 수 정 금 지 ##################################################
-###############################################################################################################
+THERMO_MODES = ('off', 'heat', 'fan_only')         # fan_only = 외출
+THERMO_MODE_CODE = {'heat': '1100', 'off': '0100', 'fan_only': '1101'}
 
-# HA MQTT Discovery
+FAN_SPEED = {'4': 'low', '8': 'medium', 'c': 'high', '0': 'off'}
+FAN_SPEED_CODE = {v: k for k, v in FAN_SPEED.items()}
+FAN_ROOM = '00'
+
+# 이 집의 환기장치는 코콤 표준 환기 패킷으로 동작하지 않아 전용 패킷으로 대체해서 보낸다. (c5ba0ad)
+# key = 표준 패킷이었다면 들어갔을 값(value) 부분
+FAN_RAW_PACKETS = {
+    '0001000000000000': 'aae10120020201006b55aa01e12082020100eb55',  # off
+    '1100800000000000': 'aae10120020202036b55aa01e12082020203eb55',  # on (medium)
+}
+
+PACKET_HEX_LEN = 42
+
+###############################################################################
+# 타이밍
+###############################################################################
+BUS_IDLE_SEC = 0.1      # 마지막 송수신 후 이만큼 조용해야 송신
+LOOP_SEC = 0.2          # scan_loop 주기
+RETRY_SEC = 1.0         # 명령 재전송 간격
+MAX_SENDS = 5           # 명령 최대 전송 횟수 (응답 없으면 포기)
+SCAN_RETRY_SEC = 2.0    # 조회 재시도 간격
+MAX_SCANS = 5           # 조회 최대 횟수 (응답 없으면 다음 SCAN_INTERVAL까지 대기)
+RECONNECT_SEC = 10      # 연결 끊김 후 재연결 간격
+
+###############################################################################
+# Home Assistant
+###############################################################################
 HA_PREFIX = 'homeassistant'
-HA_SWITCH = 'switch'
-HA_LIGHT = 'light'
-HA_CLIMATE = 'climate'
-HA_SENSOR = 'sensor'
-HA_FAN = 'fan'
+HA_STATUS_TOPIC = 'homeassistant/status'
+BRIDGE_TOPIC = 'rs485/bridge/config'
+ENTITY_PREFIX = 'kocom'  # 엔티티 이름/unique_id 접두사. 바꾸면 HA에 엔티티가 새로 생김
 
-# DEVICE 명명
-DEVICE_WALLPAD = 'wallpad'
-DEVICE_LIGHT = 'light'
-DEVICE_THERMOSTAT = 'thermostat'
-DEVICE_PLUG = 'plug'
-DEVICE_GAS = 'gas'
-DEVICE_ELEVATOR = 'elevator'
-DEVICE_FAN = 'fan'
+###############################################################################
+# 설정
+###############################################################################
+DEFAULT_OPTIONS = {
+    'RS485': {'type': 'Socket'},
+    'Socket': {'server': '', 'port': 8899},
+    'Serial': {'port1': '/dev/ttyUSB0'},
+    'MQTT': {'anonymous': False, 'server': '', 'port': 1883, 'username': '', 'password': ''},
+    'Wallpad': {'thermostat': False, 'fan': False},
+    'Advanced': {'INIT_TEMP': 22, 'SCAN_INTERVAL': 300, 'SCANNING_INTERVAL': 0.8,
+                 'DEFAULT_SPEED': 'medium', 'LOGLEVEL': 'info'},
+    # 순서대로 방 패킷 00, 01, 02 ...
+    'KOCOM_ROOM_THERMOSTAT': ['livingroom', 'bedroom', 'room1', 'room2'],
+}
 
-# KOCOM 코콤 패킷 기본정보
-KOCOM_DEVICE                = {'01': DEVICE_WALLPAD, '0e': DEVICE_LIGHT, '36': DEVICE_THERMOSTAT, '3b': DEVICE_PLUG, '44': DEVICE_ELEVATOR, '2c': DEVICE_GAS, '48': DEVICE_FAN}
-KOCOM_COMMAND               = {'3a': '조회', '00': '상태', '01': 'on', '02': 'off'}
-KOCOM_TYPE                  = {'30b': 'send', '30d': 'ack'}
-KOCOM_FAN_SPEED             = {'4': 'low', '8': 'medium', 'c': 'high', '0': 'off'}
-KOCOM_DEVICE_REV            = {v: k for k, v in KOCOM_DEVICE.items()}
-KOCOM_ROOM_REV              = {v: k for k, v in KOCOM_ROOM.items()}
-KOCOM_ROOM_THERMOSTAT_REV   = {v: k for k, v in KOCOM_ROOM_THERMOSTAT.items()}
-KOCOM_COMMAND_REV           = {v: k for k, v in KOCOM_COMMAND.items()}
-KOCOM_TYPE_REV              = {v: k for k, v in KOCOM_TYPE.items()}
-KOCOM_FAN_SPEED_REV         = {v: k for k, v in KOCOM_FAN_SPEED.items()}
-KOCOM_ROOM_REV[DEVICE_WALLPAD] = '00'
 
-# KOCOM TIME 변수
-KOCOM_INTERVAL = 100
+def to_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() == 'true'
 
-# CONFIG 파일 변수값
-CONF_FILE = 'rs485.conf'
-CONF_LOGFILE = 'rs485.log'
-CONF_LOGNAME = 'RS485'
-CONF_WALLPAD = 'Wallpad'
-CONF_MQTT = 'MQTT'
-CONF_DEVICE = 'RS485'
-CONF_SERIAL = 'Serial'
-CONF_SERIAL_DEVICE = 'SerialDevice'
-CONF_SOCKET = 'Socket'
-CONF_SOCKET_DEVICE = 'SocketDevice'
 
-# Log 폴더 생성 (도커 실행 시 로그폴더 매핑)
-def make_folder(folder_name):
-    if not os.path.isdir(folder_name):
-        os.mkdir(folder_name)
-root_dir = str(os.path.dirname(os.path.realpath(__file__)))
-log_dir = root_dir + '/log/'
-make_folder(log_dir)
-conf_path = str(root_dir + '/'+ CONF_FILE)
-log_path = str(log_dir + '/' + CONF_LOGFILE)
+def load_config():
+    '''HA 애드온이면 /data/options.json, 아니면 makeconf.sh 형식의 rs485.conf를 읽는다.'''
+    cfg = json.loads(json.dumps(DEFAULT_OPTIONS))
+    if os.path.isfile(OPTIONS_FILE):
+        with open(OPTIONS_FILE) as f:
+            src = json.load(f)
+    elif os.path.isfile(CONF_PATH):
+        parser = configparser.ConfigParser()
+        parser.read(CONF_PATH)
+        src = {section: dict(parser.items(section)) for section in parser.sections()}
+    else:
+        src = {}
+    for key, value in src.items():
+        if isinstance(cfg.get(key), dict) and isinstance(value, dict):
+            cfg[key].update(value)
+        elif key in cfg:
+            cfg[key] = value
+    return cfg
 
-class rs485:
-    def __init__(self):
-        self._mqtt_config = {}
-        self._port_url = {}
-        self._device_list = {}
-        self._wp_list = {}
-        self.type = None
+###############################################################################
+# 패킷
+###############################################################################
+Frame = namedtuple('Frame', 'type src_dev src_room dst_dev dst_room cmd value')
 
-        config = configparser.ConfigParser()
-        config.read(conf_path)
 
-        get_conf_wallpad = config.items(CONF_WALLPAD)
-        for item in get_conf_wallpad:
-            self._wp_list.setdefault(item[0], item[1])
-            logger.info('[CONFIG] {} {} : {}'.format(CONF_WALLPAD, item[0], item[1]))
+def checksum(packet):
+    return '{:02x}'.format((sum(bytes.fromhex(packet[:36])) + 1) % 256)
 
-        get_conf_mqtt = config.items(CONF_MQTT)
-        for item in get_conf_mqtt:
-            self._mqtt_config.setdefault(item[0], item[1])
-            logger.info('[CONFIG] {} {} : {}'.format(CONF_MQTT, item[0], item[1]))
 
-        d_type = config.get(CONF_LOGNAME, 'type').lower()
-        if d_type == 'serial':
-            self.type = d_type
-            get_conf_serial = config.items(CONF_SERIAL)
-            port_i = 1
-            for item in get_conf_serial:
-                if item[1] != '':
-                    self._port_url.setdefault(port_i, item[1])
-                    logger.info('[CONFIG] {} {} : {}'.format(CONF_SERIAL, item[0], item[1]))
-                port_i += 1
+def is_valid(packet):
+    return len(packet) >= PACKET_HEX_LEN and checksum(packet) == packet[36:38]
 
-            get_conf_serial_device = config.items(CONF_SERIAL_DEVICE)
-            port_i = 1
-            for item in get_conf_serial_device:
-                if item[1] != '':
-                    self._device_list.setdefault(port_i, item[1])
-                    logger.info('[CONFIG] {} {} : {}'.format(CONF_SERIAL_DEVICE, item[0], item[1]))
-                port_i += 1
-            self._con = self.connect_serial(self._port_url)
-        elif d_type == 'socket':
-            self.type = d_type
-            server = config.get(CONF_SOCKET, 'server')
-            port = config.get(CONF_SOCKET, 'port')
-            self._socket_device = config.get(CONF_SOCKET_DEVICE, 'device')
-            self._con = self.connect_socket(server, port)
-        else:
-            logger.info('[CONFIG] SERIAL / SOCKET IS NOT VALID')
-            logger.info('[CONFIG] EXIT RS485')
-            exit(1)
 
-    @property
-    def _wp_light(self):
-        return True if self._wp_list['light'] == 'True' else False
+def parse_frame(packet):
+    ptype = TYPE_NAMES.get(packet[4:7])
+    first, second = packet[10:14], packet[14:18]
+    if ptype == 'send':
+        dst, src = first, second
+    elif ptype == 'ack':
+        src, dst = first, second
+    else:
+        return None
+    return Frame(ptype, src[:2], src[2:], dst[:2], dst[2:], packet[18:20], packet[20:36])
 
-    @property
-    def _wp_fan(self):
-        return True if self._wp_list['fan'] == 'True' else False
+
+def build_packet(device, room, cmd, value):
+    body = 'aa5530bc00' + device + room + DEV_WALLPAD + '00' + cmd + value
+    return body + checksum(body) + '0d0d'
+
+
+def parse_thermostat(value, prev_target, init_temp):
+    '''난방 응답 값 -> {'current_temp', 'mode', 'target_temp'}
+    끔/외출 상태에서는 설정온도가 오지 않으므로 직전 설정온도를 유지한다.'''
+    heating = value[0:2] == '11'
+    away = value[2:4] == '01'
+    keep_target = int(prev_target) if prev_target else init_temp
+    result = {'current_temp': int(value[8:10], 16)}
+    if heating and away:
+        result['mode'] = 'fan_only'
+        result['target_temp'] = keep_target
+    elif heating:
+        result['mode'] = 'heat'
+        result['target_temp'] = int(value[4:6], 16)
+    else:
+        result['mode'] = 'off'
+        result['target_temp'] = keep_target
+    return result
+
+###############################################################################
+# 연결
+###############################################################################
+class Transport:
+    '''소켓/시리얼 연결. read()/write()는 예외를 밖으로 내보내지 않고, 에러가 나면
+    연결을 닫은 뒤 다음 read() 때 RECONNECT_SEC 간격으로 다시 연결한다.'''
+
+    def __init__(self, cfg):
+        self.kind = str(cfg['RS485']['type']).lower()
+        self.server = cfg['Socket'].get('server')
+        self.port = cfg['Socket'].get('port')
+        self.serial_port = cfg['Serial'].get('port1')
+        self.conn = None
+        self.next_retry = 0.0
+        self.lock = threading.Lock()
 
     @property
-    def _wp_thermostat(self):
-        return True if self._wp_list['thermostat'] == 'True' else False
+    def is_open(self):
+        return self.conn is not None
 
     @property
-    def _wp_plug(self):
-        return True if self._wp_list['plug'] == 'True' else False
+    def target(self):
+        return '{}:{}'.format(self.server, self.port) if self.kind == 'socket' else self.serial_port
 
-    @property
-    def _wp_gas(self):
-        return True if self._wp_list['gas'] == 'True' else False
+    def _open(self):
+        if self.kind == 'socket':
+            conn = socket.create_connection((self.server, int(self.port)), timeout=10)
+            # 변환기(EW11 등)가 전원/WiFi 문제로 조용히 끊겨도 약 1분 안에 에러가 나게 함
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, 'TCP_KEEPIDLE'):
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            conn.settimeout(1.0)  # 무한 대기하지 않도록
+            return conn
+        if serial is None:
+            raise RuntimeError('pyserial이 설치되어 있지 않습니다')
+        return serial.Serial(self.serial_port, 9600, bytesize=8, stopbits=1, timeout=1)
 
-    @property
-    def _wp_elevator(self):
-        return True if self._wp_list['elevator'] == 'True' else False
-
-    @property
-    def _device(self):
-        if self.type == 'serial':
-            return self._device_list
-        elif self.type == 'socket':
-            return self._socket_device
-
-    @property
-    def _type(self):
-        return self.type
-
-    @property
-    def _connect(self):
-        return self._con
-
-    @property
-    def _mqtt(self):
-        return self._mqtt_config
-
-    def connect_serial(self, port):
-        ser = {}
-        opened = 0
-        for p in port:
+    def ensure_open(self):
+        with self.lock:
+            if self.conn is not None:
+                return True
+            if time.time() < self.next_retry:
+                return False
             try:
-                ser[p] = serial.Serial(port[p], 9600, timeout=None)
-                if ser[p].isOpen():
-                    ser[p].bytesize = 8
-                    ser[p].stopbits = 1
-                    ser[p].autoOpen = False
-                    logger.info('Port {} : {}'.format(p, port[p]))
-                    opened += 1
-                else:
-                    logger.info('시리얼포트가 열려있지 않습니다.[{}]'.format(port[p]))
-            except serial.serialutil.SerialException:
-                logger.info('시리얼포트에 연결할 수 없습니다.[{}]'.format(port[p]))
-        if opened == 0: return False
-        return ser
+                self.conn = self._open()
+                logger.info('[Connect] 연결 성공 [{}]'.format(self.target))
+                return True
+            except Exception as e:
+                logger.warning('[Connect] 연결 실패 [{}]: {} ({}초 후 재시도)'.format(self.target, e, RECONNECT_SEC))
+                self.next_retry = time.time() + RECONNECT_SEC
+                return False
 
-    def connect_socket(self, server, port):
-        soc = socket.socket()
-        soc.settimeout(10)
-        try:
-            soc.connect((server, int(port)))
-        except Exception as e:
-            logger.info('소켓에 연결할 수 없습니다.[{}][{}:{}]'.format(e, server, port))
-            return False
-        # TCP keepalive: 변환기가 조용히 죽어도(전원/WiFi 끊김) 약 1분 내에 recv()가 에러를 냄
-        soc.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        if hasattr(socket, 'TCP_KEEPIDLE'):
-            soc.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-            soc.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-            soc.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-        # 무한 대기 대신 1초마다 깨어나 연결 상태(self.connected)를 확인할 수 있게 함
-        soc.settimeout(1.0)
-        return soc
-
-class Kocom(rs485):
-    def __init__(self, client, name, device, packet_len):
-        self.client = client
-        self._name = name
-        self.connected = True
-
-        self.ha_registry = False
-        self.kocom_scan = True
-        self.scan_packet_buf = []
-
-        self.tick = time.time()
-        self.wp_list = {}
-        self.wp_light = self.client._wp_light
-        self.wp_fan = self.client._wp_fan
-        self.wp_plug = self.client._wp_plug
-        self.wp_gas = self.client._wp_gas
-        self.wp_elevator = self.client._wp_elevator
-        self.wp_thermostat = self.client._wp_thermostat
-        for d_name in KOCOM_DEVICE.values():
-            if d_name == DEVICE_ELEVATOR or d_name == DEVICE_GAS:
-                self.wp_list[d_name] = {}
-                self.wp_list[d_name][DEVICE_WALLPAD] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
-                self.wp_list[d_name][DEVICE_WALLPAD][d_name] = {'state': 'off', 'set': 'off', 'last': 'state', 'count': 0}
-            elif d_name == DEVICE_FAN:
-                self.wp_list[d_name] = {}
-                self.wp_list[d_name][DEVICE_WALLPAD] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
-                self.wp_list[d_name][DEVICE_WALLPAD]['mode'] = {'state': 'off', 'set': 'off', 'last': 'state', 'count': 0}
-                self.wp_list[d_name][DEVICE_WALLPAD]['speed'] = {'state': 'off', 'set': 'off', 'last': 'state', 'count': 0}
-            elif d_name == DEVICE_THERMOSTAT:
-                self.wp_list[d_name] = {}
-                for r_name in KOCOM_ROOM_THERMOSTAT.values():
-                    self.wp_list[d_name][r_name] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
-                    self.wp_list[d_name][r_name]['mode'] = {'state': 'off', 'set': 'off', 'last': 'state', 'count': 0}
-                    self.wp_list[d_name][r_name]['current_temp'] = {'state': 0, 'set': 0, 'last': 'state', 'count': 0}
-                    self.wp_list[d_name][r_name]['target_temp'] = {'state': INIT_TEMP, 'set': INIT_TEMP, 'last': 'state', 'count': 0}
-            elif d_name == DEVICE_LIGHT or d_name == DEVICE_PLUG:
-                self.wp_list[d_name] = {}
-                for r_name in KOCOM_ROOM.values():
-                    self.wp_list[d_name][r_name] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
-                    if d_name == DEVICE_LIGHT:
-                        for i in range(0, KOCOM_LIGHT_SIZE[r_name] + 1):
-                            self.wp_list[d_name][r_name][d_name + str(i)] = {'state': 'off', 'set': 'off', 'last': 'state', 'count': 0}
-                    if d_name == DEVICE_PLUG:
-                        for i in range(0, KOCOM_PLUG_SIZE[r_name] + 1):
-                            self.wp_list[d_name][r_name][d_name + str(i)] = {'state': 'on', 'set': 'on', 'last': 'state', 'count': 0}
-
-        self.d_type = client._type
-        self.device = device
-        self.read_error_log_tick = 0
-        self.reconnect_tick = 0
-        if self.d_type == "serial":
-            self.d_serial = client._connect[device]
-        elif self.d_type == "socket":
-            self.d_serial = client._connect
-        self.d_mqtt = self.connect_mqtt(self.client._mqtt, name)
-
-        self._t1 = threading.Thread(target=self.get_serial, args=(name, packet_len))
-        self._t1.start()
-        self._t2 = threading.Thread(target=self.scan_list)
-        self._t2.start()
-
-    def connection_lost(self):
-        self._t1.join()
-        self._t2.join()
-        if not self.connected:
-            logger.debug('[ERROR] 서버 연결이 끊어져 kocom 클래스를 종료합니다.')
-            # 재접속 시 새 Kocom 인스턴스가 만들어지므로 기존 MQTT/소켓 정리
+    def close(self, reason):
+        with self.lock:
+            if self.conn is None:
+                return
+            logger.warning('[Connect] 연결 끊김 [{}]: {} ({}초 후 재연결)'.format(self.target, reason, RECONNECT_SEC))
             try:
-                if self.d_mqtt:
-                    self.d_mqtt.loop_stop()
-                    self.d_mqtt.disconnect()
+                self.conn.close()
             except Exception:
                 pass
-            try:
-                self.d_serial.close()
-            except Exception:
-                pass
-            return False
+            self.conn = None
+            self.next_retry = time.time() + RECONNECT_SEC
 
     def read(self):
-        # 항상 bytes를 반환해야 get_serial()에서 .hex() 호출이 실패하지 않음
-        if self.client._connect == False:
-            if self.d_type == 'socket':
-                # 최초 소켓 연결 실패: 메인 루프가 재접속하도록 종료 신호
-                self.connected = False
+        '''받은 bytes. 데이터가 없거나(최대 1초 대기) 연결이 안 되어 있으면 b''.'''
+        if not self.ensure_open():
+            time.sleep(0.5)
             return b''
+        conn = self.conn
         try:
-            if self.d_type == 'serial':
-                if self.d_serial.readable():
-                    return self.d_serial.read()
-                return b''
-            elif self.d_type == 'socket':
+            if self.kind == 'socket':
                 try:
-                    data = self.d_serial.recv(1)
+                    data = conn.recv(64)
                 except socket.timeout:
-                    # 1초 동안 들어온 데이터가 없을 뿐, 에러 아님
                     return b''
                 if not data:
-                    # recv()가 빈 값이면 상대가 연결을 닫은 것
-                    raise ConnectionError('socket closed by peer')
+                    raise ConnectionError('상대방이 연결을 닫음')
                 return data
+            return conn.read(max(1, conn.in_waiting))
         except Exception as e:
-            self.handle_read_error(e)
-        return b''
-
-    def handle_read_error(self, e):
-        now = time.time()
-        # 같은 에러가 반복되면 10초에 한 번만 기록
-        if now - self.read_error_log_tick > 10:
-            logger.warning('[Serial Read] Connection Error: {}'.format(e))
-            self.read_error_log_tick = now
-        if self.d_type == 'socket':
-            # 메인 루프가 60초 후 새 소켓으로 재접속
-            self.connected = False
-        elif self.d_type == 'serial':
-            self.reconnect_serial()
-
-    def reconnect_serial(self):
-        now = time.time()
-        if now - self.reconnect_tick < 5:
-            time.sleep(0.5)
-            return
-        self.reconnect_tick = now
-        port = self.client._port_url.get(self.device)
-        try:
-            self.d_serial.close()
-        except Exception:
-            pass
-        try:
-            ser = serial.Serial(port, 9600, timeout=None)
-            ser.bytesize = 8
-            ser.stopbits = 1
-            self.d_serial = ser
-            self.client._con[self.device] = ser
-            logger.warning('[Serial] 재연결 성공 [{}]'.format(port))
-        except Exception as e:
-            logger.warning('[Serial] 재연결 실패 [{}]: {}'.format(port, e))
+            self.close(e)
+            return b''
 
     def write(self, data):
-        if data == False:
-            return
-        self.tick = time.time()
-        if self.client._connect == False:
-            return
+        conn = self.conn
+        if conn is None:
+            return False
         try:
-            if self.d_type == 'serial':
-                return self.d_serial.write(bytearray.fromhex((data)))
-            elif self.d_type == 'socket':
-                return self.d_serial.sendall(bytearray.fromhex((data)))
+            if self.kind == 'socket':
+                conn.sendall(data)
+            else:
+                conn.write(data)
+            return True
         except Exception as e:
-            logger.warning('[Serial Write] Connection Error: {}'.format(e))
-            if self.d_type == 'socket':
-                # 송신 실패도 연결 끊김으로 보고 메인 루프 재접속을 유도
-                self.connected = False
+            self.close(e)
+            return False
 
-    def connect_mqtt(self, server, name):
-        mqtt_client = mqtt.Client()
-        mqtt_client.on_message = self.on_message
-        #mqtt_client.on_publish = self.on_publish
-        mqtt_client.on_subscribe = self.on_subscribe
-        mqtt_client.on_connect = self.on_connect
+###############################################################################
+# 장치
+###############################################################################
+class Unit:
+    '''난방 방 하나 또는 환기장치 하나.
+    state   : 월패드에서 확인한 상태
+    desired : HA가 요청한 상태. pending이면 월패드에 반영될 때까지(최대 MAX_SENDS회) 전송'''
 
-        if server['anonymous'] != 'True':
-            if server['server'] == '' or server['username'] == '' or server['password'] == '':
-                logger.info('{} 설정을 확인하세요. Server[{}] ID[{}] PW[{}] Device[{}]'.format(CONF_MQTT, server['server'], server['username'], server['password'], name))
-                return False
-            mqtt_client.username_pw_set(username=server['username'], password=server['password'])
-            logger.debug('{} STATUS. Server[{}] ID[{}] PW[{}] Device[{}]'.format(CONF_MQTT, server['server'], server['username'], server['password'], name))
-        else:
-            logger.debug('{} STATUS. Server[{}] Device[{}]'.format(CONF_MQTT, server['server'], name))
+    def __init__(self, kind, name, device, room_code, state, needs_ack):
+        self.kind = kind            # 'thermostat' | 'fan'
+        self.name = name            # HA 토픽에 쓰이는 이름 (livingroom, wallpad ...)
+        self.device = device
+        self.room_code = room_code
+        self.state = dict(state)
+        self.desired = dict(state)
+        self.needs_ack = needs_ack  # False면 응답 확인 없이 MAX_SENDS회 전송
+        self.pending = False
+        self.sends = 0
+        self.sent_at = 0.0
+        self.reset_scan()
 
-        mqtt_client.connect(server['server'], 1883, 60)
-        mqtt_client.loop_start()
-        return mqtt_client
+    def request(self, **changes):
+        self.desired.update(changes)
+        self.pending = True
+        self.sends = 0
+        self.sent_at = 0.0
 
-    def on_message(self, client, obj, msg):
-        _topic = msg.topic.split('/')
-        _payload = msg.payload.decode()
+    def reset_scan(self):
+        self.scan_tick = 0.0     # 마지막으로 상태를 확인한 시각
+        self.scan_sent_at = 0.0
+        self.scans = 0
 
-        if 'config' in _topic and _topic[0] == 'rs485' and _topic[1] == 'bridge' and _topic[2] == 'config':
-            if _topic[3] == 'log_level':
-                if _payload == "info": logger.setLevel(logging.INFO)
-                if _payload == "debug": logger.setLevel(logging.DEBUG)
-                if _payload == "warn": logger.setLevel(logging.WARN)
-                logger.info('[From HA]Set Loglevel to {}'.format(_payload))
-                return
-            elif _topic[3] == 'restart':
-                self.homeassistant_device_discovery()
-                logger.info('[From HA]HomeAssistant Restart')
-                return
-            elif _topic[3] == 'remove':
-                self.homeassistant_device_discovery(remove=True)
-                logger.info('[From HA]HomeAssistant Remove')
-                return
-            elif _topic[3] == 'scan':
-                for d_name in KOCOM_DEVICE.values():
-                    if d_name == DEVICE_ELEVATOR or d_name == DEVICE_GAS:
-                        self.wp_list[d_name][DEVICE_WALLPAD] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
-                    elif d_name == DEVICE_FAN:
-                        self.wp_list[d_name][DEVICE_WALLPAD] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
-                    elif d_name == DEVICE_THERMOSTAT:
-                        for r_name in KOCOM_ROOM_THERMOSTAT.values():
-                            self.wp_list[d_name][r_name] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
-                    elif d_name == DEVICE_LIGHT or d_name == DEVICE_PLUG:
-                        for r_name in KOCOM_ROOM.values():
-                            self.wp_list[d_name][r_name] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
-                logger.info('[From HA]HomeAssistant Scan')
-                return
-            elif _topic[3] == 'packet':
-                self.packet_parsing(_payload.lower(), name='HA')
-            elif _topic[3] == 'check_sum':
-                chksum = self.check_sum(_payload.lower())
-                logger.info('[From HA]{} = {}({})'.format(_payload, chksum[0], chksum[1]))
-        elif not self.kocom_scan:
-            self.parse_message(_topic, _payload)
+    def mark_scanned(self):
+        self.scan_tick = time.time()
+        self.scan_sent_at = 0.0
+        self.scans = 0
+
+###############################################################################
+# 코콤
+###############################################################################
+class Kocom:
+    def __init__(self, cfg, transport):
+        adv = cfg['Advanced']
+        self.init_temp = int(adv['INIT_TEMP'])
+        self.scan_interval = float(adv['SCAN_INTERVAL'])
+        self.scanning_interval = float(adv['SCANNING_INTERVAL'])
+        self.default_speed = adv['DEFAULT_SPEED']
+        if self.default_speed not in ('low', 'medium', 'high'):
+            logger.warning('[Config] DEFAULT_SPEED 설정오류로 medium 으로 설정. {} -> medium'.format(self.default_speed))
+            self.default_speed = 'medium'
+
+        self.transport = transport
+        self.lock = threading.RLock()
+        self.last_activity = 0.0
+        self.mqtt_ready = threading.Event()
+
+        self.thermostats = {}   # 방이름 -> Unit
+        self.thermo_rooms = {}  # 방코드 -> 방이름
+        if to_bool(cfg['Wallpad'].get('thermostat')):
+            for i, room in enumerate(cfg['KOCOM_ROOM_THERMOSTAT']):
+                code = '{:02d}'.format(i)
+                self.thermo_rooms[code] = room
+                self.thermostats[room] = Unit(
+                    'thermostat', room, DEV_THERMOSTAT, code,
+                    {'mode': 'off', 'current_temp': 0, 'target_temp': self.init_temp}, needs_ack=True)
+        self.fan = None
+        if to_bool(cfg['Wallpad'].get('fan')):
+            # 전용 패킷(FAN_RAW_PACKETS)에 대한 응답은 해석할 수 없으므로 응답 확인 없이 반복 전송
+            self.fan = Unit('fan', 'wallpad', DEV_FAN, FAN_ROOM, {'mode': 'off', 'speed': 'off'}, needs_ack=False)
+
+        self.mqtt_conf = cfg['MQTT']
+        self.mqtt = self.make_mqtt(self.mqtt_conf)
+
+    def units(self):
+        units = list(self.thermostats.values())
+        if self.fan:
+            units.append(self.fan)
+        return units
+
+    def run(self):
+        logger.info('[Config] 연결 {} [{}], 난방 {}, 환기 {}'.format(
+            self.transport.kind, self.transport.target, list(self.thermostats) or '사용안함',
+            '사용' if self.fan else '사용안함'))
+        self.mqtt.connect_async(self.mqtt_conf['server'], int(self.mqtt_conf.get('port') or 1883), 60)
+        self.mqtt.loop_start()  # 끊기면 paho가 자동 재연결
+        threading.Thread(target=self.read_loop, name='kocom-read', daemon=True).start()
+        self.scan_loop()
+
+    # ---------------------------------------------------------------- 수신
+    def read_loop(self):
+        packet = ''
+        while True:
+            try:
+                for byte in self.transport.read():
+                    h = '{:02x}'.format(byte)
+                    if not packet and h != 'aa':
+                        continue
+                    packet += h
+                    if len(packet) >= PACKET_HEX_LEN:
+                        if is_valid(packet):
+                            self.last_activity = time.time()
+                            self.handle_packet(packet)
+                        packet = ''
+            except Exception:
+                logger.exception('[Read] 처리 중 예외, 패킷 버림: {}'.format(packet))
+                packet = ''
+                time.sleep(0.1)
+
+    def room_name(self, device, room_code):
+        if device == DEV_THERMOSTAT:
+            return self.thermo_rooms.get(room_code, room_code)
+        return room_code
+
+    def handle_packet(self, packet, source='kocom'):
+        frame = parse_frame(packet)
+        if frame is None:
+            logger.debug('[From {}]알 수 없는 패킷 {}'.format(source, packet))
             return
-        logger.info("Message: {} = {}".format(msg.topic, _payload))
-        
-        if self.ha_registry != False and self.ha_registry == msg.topic and self.kocom_scan:
-            self.kocom_scan = False
+        logger.debug('[From {}]{} {}({}) {}({}) -> {}({}) = {}'.format(
+            source, packet, frame.type, COMMAND_NAMES.get(frame.cmd, frame.cmd),
+            DEVICE_NAMES.get(frame.src_dev, frame.src_dev), self.room_name(frame.src_dev, frame.src_room),
+            DEVICE_NAMES.get(frame.dst_dev, frame.dst_dev), self.room_name(frame.dst_dev, frame.dst_room),
+            frame.value))
+        # 난방 응답만 상태로 반영한다 (c5ba0ad). 환기 응답은 무시.
+        if frame.type == 'ack' and frame.src_dev == DEV_THERMOSTAT:
+            self.on_thermostat_state(frame)
 
-    def parse_message(self, topic, payload):
-        device = topic[1]
-        command = topic[3]
-        if device == HA_LIGHT or device == HA_SWITCH:
-            room_device = topic[2].split('_')
-            room = room_device[0]
-            sub_device = room_device[1]
-            if sub_device.find(DEVICE_LIGHT) != -1:
-                device = DEVICE_LIGHT
-            if sub_device.find(DEVICE_PLUG) != -1:
-                device = DEVICE_PLUG
-            if sub_device.find(DEVICE_ELEVATOR) != -1:
-                device = DEVICE_ELEVATOR
-            if sub_device.find(DEVICE_GAS) != -1:
-                device = DEVICE_GAS
+    def on_thermostat_state(self, frame):
+        unit = self.thermostats.get(self.thermo_rooms.get(frame.src_room))
+        if unit is None:
+            return
+        with self.lock:
+            value = parse_thermostat(frame.value, unit.state['target_temp'], self.init_temp)
+            unit.state.update(value)
+            unit.mark_scanned()
+            if unit.pending:
+                if value['mode'] == unit.desired['mode'] and (
+                        value['mode'] != 'heat' or value['target_temp'] == unit.desired['target_temp']):
+                    unit.pending = False
+            else:
+                # 월패드에서 직접 바꾼 값도 따라감 -> 이후 HA 명령이 옛 값을 보내지 않도록
+                unit.desired.update(mode=value['mode'], target_temp=value['target_temp'])
+        logger.info('[From kocom]thermostat/{}/state = {}'.format(unit.name, value))
+        self.publish_state(unit, value)
+
+    # ---------------------------------------------------------------- 송신
+    def scan_loop(self):
+        while True:
             try:
-                if device == DEVICE_GAS:
-                    if payload == 'on':
-                        payload = 'off'
-                        logger.info('[From HA]Error GAS Cannot Set to ON')
-                    else:
-                        self.wp_list[device][room][sub_device][command] = payload
-                        self.wp_list[device][room][sub_device]['last'] = command
-                elif device == DEVICE_ELEVATOR:
-                    if payload == 'off':
-                        self.wp_list[device][room][sub_device][command] = payload
-                        self.wp_list[device][room][sub_device]['last'] = 'state'
-                        self.send_to_homeassistant(device, DEVICE_WALLPAD, payload)
-                    else:
-                        self.wp_list[device][room][sub_device][command] = payload
-                        self.wp_list[device][room][sub_device]['last'] = command
+                if self.mqtt_ready.is_set() and self.transport.is_open:
+                    self.scan_once()
+            except Exception:
+                logger.exception('[Scan]Error')
+            time.sleep(LOOP_SEC)
+
+    def scan_once(self):
+        for unit in self.units():
+            now = time.time()
+            if now - self.last_activity < BUS_IDLE_SEC:
+                return  # 버스 사용 중. 다음 주기에 이어서
+            if now - unit.scan_tick > self.scan_interval:
+                # 상태 확인할 때가 됨: 응답이 올 때까지 SCAN_RETRY_SEC 간격으로 최대 MAX_SCANS회 조회
+                if now - unit.scan_sent_at > SCAN_RETRY_SEC:
+                    unit.scans += 1
+                    unit.scan_sent_at = now
+                    self.send(unit, build_packet(unit.device, unit.room_code, CMD_QUERY, EMPTY_VALUE), '조회')
+                    time.sleep(self.scanning_interval)
+                if unit.scans >= MAX_SCANS:
+                    unit.scan_tick = now
+                    unit.scan_sent_at = 0.0
+                    unit.scans = 0
+            else:
+                self.process_pending(unit, now)
+
+    def process_pending(self, unit, now):
+        with self.lock:
+            if not unit.pending:
+                return
+            if unit.sends >= MAX_SENDS:
+                unit.pending = False
+                if unit.needs_ack:
+                    logger.warning('[To kocom]{}/{} 응답 없음, 명령 포기 {}'.format(unit.kind, unit.name, unit.desired))
                 else:
-                    self.wp_list[device][room][sub_device][command] = payload
-                    self.wp_list[device][room][sub_device]['last'] = command
-                logger.info('[From HA]{}/{}/{}/{} = {}'.format(device, room, sub_device, command, payload))
-            except:
-                logger.info('[From HA]Error {} = {}'.format(topic, payload))
-        elif device == HA_CLIMATE:
-            device = DEVICE_THERMOSTAT
-            room = topic[2]
-            try:
-                if command != 'mode':
-                    self.wp_list[device][room]['target_temp']['set'] = int(float(payload))
-                    self.wp_list[device][room]['mode']['set'] = 'heat'
-                    self.wp_list[device][room]['target_temp']['last'] = 'set'
-                    self.wp_list[device][room]['mode']['last'] = 'set'
-                elif command == 'mode':
-                    self.wp_list[device][room]['mode']['set'] = payload
-                    self.wp_list[device][room]['mode']['last'] = 'set'
-                ha_payload = {
-                    'mode': self.wp_list[device][room]['mode']['set'],
-                    'target_temp': self.wp_list[device][room]['target_temp']['set'],
-                    'current_temp': self.wp_list[device][room]['current_temp']['state']
-                }
-                logger.info('[From HA]{}/{}/set = [mode={}, target_temp={}]'.format(device, room, self.wp_list[device][room]['mode']['set'], self.wp_list[device][room]['target_temp']['set']))
-                self.send_to_homeassistant(device, room, ha_payload)
-            except:
-                logger.info('[From HA]Error {} = {}'.format(topic, payload))
-        elif device == HA_FAN:
-            device = DEVICE_FAN
-            room = topic[2]
-            try:
-                if command != 'mode':
-                    self.wp_list[device][room]['speed']['set'] = payload
-                    self.wp_list[device][room]['mode']['set'] = 'on'
-                elif command == 'mode':
-                    self.wp_list[device][room]['speed']['set'] = DEFAULT_SPEED if payload == 'on' else 'off'
-                    self.wp_list[device][room]['mode']['set'] = payload
-                self.wp_list[device][room]['speed']['last'] = 'set'
-                self.wp_list[device][room]['mode']['last'] = 'set'
-                ha_payload = {
-                    'mode': self.wp_list[device][room]['mode']['set'],
-                    'speed': self.wp_list[device][room]['speed']['set']
-                }
-                logger.info('[From HA]{}/{}/set = [mode={}, speed={}]'.format(device, room, self.wp_list[device][room]['mode']['set'], self.wp_list[device][room]['speed']['set']))
-                self.send_to_homeassistant(device, room, ha_payload)
-            except:
-                logger.info('[From HA]Error {} = {}'.format(topic, payload))
+                    unit.state.update(unit.desired)
+                return
+            if unit.sends and now - unit.sent_at <= RETRY_SEC:
+                return
+            unit.sends += 1
+            unit.sent_at = now
+            packet = self.command_packet(unit)
+            desc = '{} ({}/{})'.format(', '.join('{}={}'.format(k, v) for k, v in sorted(unit.desired.items())
+                                                 if k != 'current_temp'), unit.sends, MAX_SENDS)
+        self.send(unit, packet, desc)
 
-    def on_publish(self, client, obj, mid):
-        logger.info("Publish: {}".format(str(mid)))
+    def command_packet(self, unit):
+        d = unit.desired
+        if unit.kind == 'thermostat':
+            value = THERMO_MODE_CODE[d['mode']] + '{:02x}'.format(int(d['target_temp'])) + '0' * 10
+            return build_packet(unit.device, unit.room_code, CMD_STATE, value)
+        value = ('1100' if d['mode'] == 'on' else '0001') + FAN_SPEED_CODE[d['speed']] + '0' * 11
+        return FAN_RAW_PACKETS.get(value) or build_packet(unit.device, unit.room_code, CMD_STATE, value)
 
-    def on_subscribe(self, client, obj, mid, granted_qos):
-        logger.info("Subscribed: {} {}".format(str(mid),str(granted_qos)))
+    def send(self, unit, packet, desc):
+        logger.info('[To kocom]{}/{} -> {}'.format(unit.kind, unit.name, desc))
+        logger.debug('[To kocom]{}'.format(packet))
+        self.last_activity = time.time()
+        self.transport.write(bytes.fromhex(packet))
+
+    # ---------------------------------------------------------------- MQTT
+    def make_mqtt(self, conf):
+        try:
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)  # paho-mqtt 2.x
+        except AttributeError:
+            client = mqtt.Client()                                  # paho-mqtt 1.x
+        if not to_bool(conf.get('anonymous')):
+            if not conf.get('username') or not conf.get('password'):
+                logger.error('[MQTT] username/password 설정을 확인하세요. Server[{}]'.format(conf.get('server')))
+            else:
+                client.username_pw_set(username=conf['username'], password=conf['password'])
+        client.on_connect = self.on_connect
+        client.on_message = self.on_message
+        return client
 
     def on_connect(self, client, userdata, flags, rc):
         if int(rc) == 0:
-            logger.info("[MQTT] connected OK")
-            self.homeassistant_device_discovery(initial=True)
-        elif int(rc) == 1:
-            logger.info("[MQTT] 1: Connection refused – incorrect protocol version")
-        elif int(rc) == 2:
-            logger.info("[MQTT] 2: Connection refused – invalid client identifier")
-        elif int(rc) == 3:
-            logger.info("[MQTT] 3: Connection refused – server unavailable")
-        elif int(rc) == 4:
-            logger.info("[MQTT] 4: Connection refused – bad username or password")
-        elif int(rc) == 5:
-            logger.info("[MQTT] 5: Connection refused – not authorised")
-        else:
-            logger.info("[MQTT] {} : Connection refused".format(rc))
+            logger.info('[MQTT] connected OK')
+            self.discovery()
+            self.mqtt_ready.set()
+            return
+        reasons = {1: 'incorrect protocol version', 2: 'invalid client identifier', 3: 'server unavailable',
+                   4: 'bad username or password', 5: 'not authorised'}
+        logger.warning('[MQTT] {}: Connection refused - {}'.format(rc, reasons.get(int(rc), 'unknown')))
 
-    def homeassistant_device_discovery(self, initial=False, remove=False):
-        subscribe_list = []
-        subscribe_list.append(('rs485/bridge/#', 0))
-        publish_list = []
-        
-        self.ha_registry = False
-        self.kocom_scan = True
+    @staticmethod
+    def ha_device(name):
+        return {'name': 'Kocom {}'.format(name), 'ids': 'kocom_{}'.format(name),
+                'mf': 'KOCOM', 'mdl': 'Wallpad', 'sw': SW_VERSION}
 
-        if self.wp_elevator:
-            ha_topic = '{}/{}/{}_{}/config'.format(HA_PREFIX, HA_SWITCH, 'wallpad', DEVICE_ELEVATOR)
-            ha_payload = {
-                'name': '{}_{}_{}'.format(self._name, 'wallpad', DEVICE_ELEVATOR),
-                'cmd_t': '{}/{}/{}_{}/set'.format(HA_PREFIX, HA_SWITCH, 'wallpad', DEVICE_ELEVATOR),
-                'stat_t': '{}/{}/{}/state'.format(HA_PREFIX, HA_SWITCH, 'wallpad'),
-                'val_tpl': '{{ value_json.' + DEVICE_ELEVATOR + ' }}',
-                'ic': 'mdi:elevator',
-                'pl_on': 'on',
-                'pl_off': 'off',
-                'uniq_id': '{}_{}_{}'.format(self._name, 'wallpad', DEVICE_ELEVATOR),
-                'device': {
-                    'name': 'Kocom {}'.format('wallpad'),
-                    'ids': 'kocom_{}'.format('wallpad'),
-                    'mf': 'KOCOM',
-                    'mdl': 'Wallpad',
-                    'sw': SW_VERSION
-                }
-            }
-            subscribe_list.append((ha_topic, 0))
-            subscribe_list.append((ha_payload['cmd_t'], 0))
-            #subscribe_list.append((ha_payload['stat_t'], 0))
-            if remove:
-                publish_list.append({ha_topic : ''})
-            else:
-                publish_list.append({ha_topic : json.dumps(ha_payload)})
-        if self.wp_gas:
-            ha_topic = '{}/{}/{}_{}/config'.format(HA_PREFIX, HA_SWITCH, 'wallpad', DEVICE_GAS)
-            ha_payload = {
-                'name': '{}_{}_{}'.format(self._name, 'wallpad', DEVICE_GAS),
-                'cmd_t': '{}/{}/{}_{}/set'.format(HA_PREFIX, HA_SWITCH, 'wallpad', DEVICE_GAS),
-                'stat_t': '{}/{}/{}_{}/state'.format(HA_PREFIX, HA_SWITCH, 'wallpad', DEVICE_GAS),
-                'val_tpl': '{{ value_json.' + DEVICE_GAS + ' }}',
-                'ic': 'mdi:gas-cylinder',
-                'pl_on': 'on',
-                'pl_off': 'off',
-                'uniq_id': '{}_{}_{}'.format(self._name, 'wallpad', DEVICE_GAS),
-                'device': {
-                    'name': 'Kocom {}'.format('wallpad'),
-                    'ids': 'kocom_{}'.format('wallpad'),
-                    'mf': 'KOCOM',
-                    'mdl': 'Wallpad',
-                    'sw': SW_VERSION
-                }
-            }
-            subscribe_list.append((ha_topic, 0))
-            subscribe_list.append((ha_payload['cmd_t'], 0))
-            #subscribe_list.append((ha_payload['stat_t'], 0))
-            if remove:
-                publish_list.append({ha_topic : ''})
-            else:
-                publish_list.append({ha_topic : json.dumps(ha_payload)})
-
-            ha_topic = '{}/{}/{}_{}/config'.format(HA_PREFIX, HA_SENSOR, 'wallpad', DEVICE_GAS)
-            ha_payload = {
-                'name': '{}_{}_{}'.format(self._name, 'wallpad', DEVICE_GAS),
-                'stat_t': '{}/{}/{}_{}/state'.format(HA_PREFIX, HA_SENSOR, 'wallpad', DEVICE_GAS),
-                'val_tpl': '{{ value_json.' + DEVICE_GAS + ' }}',
-                'ic': 'mdi:gas-cylinder',
-                'uniq_id': '{}_{}_{}'.format(self._name, 'wallpad', DEVICE_GAS),
-                'device': {
-                    'name': 'Kocom {}'.format('wallpad'),
-                    'ids': 'kocom_{}'.format('wallpad'),
-                    'mf': 'KOCOM',
-                    'mdl': 'Wallpad',
-                    'sw': SW_VERSION
-                }
-            }
-            subscribe_list.append((ha_topic, 0))
-            #subscribe_list.append((ha_payload['stat_t'], 0))
-            publish_list.append({ha_topic : json.dumps(ha_payload)})
-        if self.wp_fan:
-            ha_topic = '{}/{}/{}_{}/config'.format(HA_PREFIX, HA_FAN, 'wallpad', DEVICE_FAN)
-            ha_payload = {
-                'name': '{}_{}_{}'.format(self._name, 'wallpad', DEVICE_FAN),
-                'cmd_t': '{}/{}/{}/mode'.format(HA_PREFIX, HA_FAN, 'wallpad'),
-                'stat_t': '{}/{}/{}/state'.format(HA_PREFIX, HA_FAN, 'wallpad'),
-                'spd_cmd_t': '{}/{}/{}/speed'.format(HA_PREFIX, HA_FAN, 'wallpad'),
-                'spd_stat_t': '{}/{}/{}/state'.format(HA_PREFIX, HA_FAN, 'wallpad'),
+    def discovery_configs(self):
+        configs = []
+        if self.fan:
+            base = '{}/fan/wallpad'.format(HA_PREFIX)
+            configs.append(('{}/fan/wallpad_fan/config'.format(HA_PREFIX), {
+                'name': '{}_wallpad_fan'.format(ENTITY_PREFIX),
+                'cmd_t': base + '/mode',
+                'stat_t': base + '/state',
+                'spd_cmd_t': base + '/speed',
+                'spd_stat_t': base + '/state',
                 'stat_val_tpl': '{{ value_json.mode }}',
                 'spd_val_tpl': '{{ value_json.speed }}',
                 'pl_on': 'on',
                 'pl_off': 'off',
                 'spds': ['low', 'medium', 'high', 'off'],
-                'uniq_id': '{}_{}_{}'.format(self._name, 'wallpad', DEVICE_FAN),
-                'device': {
-                    'name': 'Kocom {}'.format('wallpad'),
-                    'ids': 'kocom_{}'.format('wallpad'),
-                    'mf': 'KOCOM',
-                    'mdl': 'Wallpad',
-                    'sw': SW_VERSION
-                }
-            }
-            subscribe_list.append((ha_topic, 0))
-            subscribe_list.append((ha_payload['cmd_t'], 0))
-            #subscribe_list.append((ha_payload['stat_t'], 0))
-            subscribe_list.append((ha_payload['spd_cmd_t'], 0))
-            if remove:
-                publish_list.append({ha_topic : ''})
-            else:
-                publish_list.append({ha_topic : json.dumps(ha_payload)})
-        if self.wp_light:
-            for room, r_value in self.wp_list[DEVICE_LIGHT].items():
-                if type(r_value) == dict:
-                    for sub_device, d_value in r_value.items():
-                        if type(d_value) == dict:
-                            ha_topic = '{}/{}/{}_{}/config'.format(HA_PREFIX, HA_LIGHT, room, sub_device)
-                            ha_payload = {
-                                'name': '{}_{}_{}'.format(self._name, room, sub_device),
-                                'cmd_t': '{}/{}/{}_{}/set'.format(HA_PREFIX, HA_LIGHT, room, sub_device),
-                                'stat_t': '{}/{}/{}/state'.format(HA_PREFIX, HA_LIGHT, room),
-                                'val_tpl': '{{ value_json.' + str(sub_device) + ' }}',
-                                'pl_on': 'on',
-                                'pl_off': 'off',
-                                'uniq_id': '{}_{}_{}'.format(self._name, room, sub_device),
-                                'device': {
-                                    'name': 'Kocom {}'.format(room),
-                                    'ids': 'kocom_{}'.format(room),
-                                    'mf': 'KOCOM',
-                                    'mdl': 'Wallpad',
-                                    'sw': SW_VERSION
-                                }
-                            }
-                            subscribe_list.append((ha_topic, 0))
-                            subscribe_list.append((ha_payload['cmd_t'], 0))
-                            #subscribe_list.append((ha_payload['stat_t'], 0))
-                            if remove:
-                                publish_list.append({ha_topic : ''})
-                            else:
-                                publish_list.append({ha_topic : json.dumps(ha_payload)})
-        if self.wp_plug:
-            for room, r_value in self.wp_list[DEVICE_PLUG].items():
-                if type(r_value) == dict:
-                    for sub_device, d_value in r_value.items():
-                        if type(d_value) == dict:
-                            ha_topic = '{}/{}/{}_{}/config'.format(HA_PREFIX, HA_SWITCH, room, sub_device)
-                            ha_payload = {
-                                'name': '{}_{}_{}'.format(self._name, room, sub_device),
-                                'cmd_t': '{}/{}/{}_{}/set'.format(HA_PREFIX, HA_SWITCH, room, sub_device),
-                                'stat_t': '{}/{}/{}/state'.format(HA_PREFIX, HA_SWITCH, room),
-                                'val_tpl': '{{ value_json.' + str(sub_device) + ' }}',
-                                'ic': 'mdi:power-socket-eu',
-                                'pl_on': 'on',
-                                'pl_off': 'off',
-                                'uniq_id': '{}_{}_{}'.format(self._name, room, sub_device),
-                                'device': {
-                                    'name': 'Kocom {}'.format(room),
-                                    'ids': 'kocom_{}'.format(room),
-                                    'mf': 'KOCOM',
-                                    'mdl': 'Wallpad',
-                                    'sw': SW_VERSION
-                                }
-                            }
-                            subscribe_list.append((ha_topic, 0))
-                            subscribe_list.append((ha_payload['cmd_t'], 0))
-                            #subscribe_list.append((ha_payload['stat_t'], 0))
-                            if remove:
-                                publish_list.append({ha_topic : ''})
-                            else:
-                                publish_list.append({ha_topic : json.dumps(ha_payload)})
-        if self.wp_thermostat:
-            for room, r_list in self.wp_list[DEVICE_THERMOSTAT].items():
-                if type(r_list) == dict:
-                    ha_topic = '{}/{}/{}/config'.format(HA_PREFIX, HA_CLIMATE, room)
-                    ha_payload = {
-                        'name': '{}_{}_{}'.format(self._name, room, DEVICE_THERMOSTAT),
-                        'mode_cmd_t': '{}/{}/{}/mode'.format(HA_PREFIX, HA_CLIMATE, room),
-                        'mode_stat_t': '{}/{}/{}/state'.format(HA_PREFIX, HA_CLIMATE, room),
-                        'mode_stat_tpl': '{{ value_json.mode }}',
-                        'temp_cmd_t': '{}/{}/{}/target_temp'.format(HA_PREFIX, HA_CLIMATE, room),
-                        'temp_stat_t': '{}/{}/{}/state'.format(HA_PREFIX, HA_CLIMATE, room),
-                        'temp_stat_tpl': '{{ value_json.target_temp }}',
-                        'curr_temp_t': '{}/{}/{}/state'.format(HA_PREFIX, HA_CLIMATE, room),
-                        'curr_temp_tpl': '{{ value_json.current_temp }}',
-                        'min_temp': 5,
-                        'max_temp': 40,
-                        'temp_step': 1,
-                        'modes': ['off', 'heat', 'fan_only'],
-                        'uniq_id': '{}_{}_{}'.format(self._name, room, DEVICE_THERMOSTAT),
-                        'device': {
-                            'name': 'Kocom {}'.format(room),
-                            'ids': 'kocom_{}'.format(room),
-                            'mf': 'KOCOM',
-                            'mdl': 'Wallpad',
-                            'sw': SW_VERSION
-                        }
-                    }
-                    subscribe_list.append((ha_topic, 0))
-                    subscribe_list.append((ha_payload['mode_cmd_t'], 0))
-                    #subscribe_list.append((ha_payload['mode_stat_t'], 0))
-                    subscribe_list.append((ha_payload['temp_cmd_t'], 0))
-                    #subscribe_list.append((ha_payload['temp_stat_t'], 0))
-                    if remove:
-                        publish_list.append({ha_topic : ''})
-                    else:
-                        publish_list.append({ha_topic : json.dumps(ha_payload)})
+                'uniq_id': '{}_wallpad_fan'.format(ENTITY_PREFIX),
+                'device': self.ha_device('wallpad'),
+            }))
+        for room in self.thermostats:
+            base = '{}/climate/{}'.format(HA_PREFIX, room)
+            configs.append((base + '/config', {
+                'name': '{}_{}_thermostat'.format(ENTITY_PREFIX, room),
+                'mode_cmd_t': base + '/mode',
+                'mode_stat_t': base + '/state',
+                'mode_stat_tpl': '{{ value_json.mode }}',
+                'temp_cmd_t': base + '/target_temp',
+                'temp_stat_t': base + '/state',
+                'temp_stat_tpl': '{{ value_json.target_temp }}',
+                'curr_temp_t': base + '/state',
+                'curr_temp_tpl': '{{ value_json.current_temp }}',
+                'min_temp': 5,
+                'max_temp': 40,
+                'temp_step': 1,
+                'modes': list(THERMO_MODES),
+                'uniq_id': '{}_{}_thermostat'.format(ENTITY_PREFIX, room),
+                'device': self.ha_device(room),
+            }))
+        return configs
 
-        if initial:
-            self.d_mqtt.subscribe(subscribe_list)
-        for ha in publish_list:
-            for topic, payload in ha.items():
-                self.d_mqtt.publish(topic, payload)
-        self.ha_registry = ha_topic
+    def discovery(self, remove=False):
+        subscribe = [(BRIDGE_TOPIC + '/#', 0), (HA_STATUS_TOPIC, 0)]
+        for topic, payload in self.discovery_configs():
+            for key in ('cmd_t', 'spd_cmd_t', 'mode_cmd_t', 'temp_cmd_t'):
+                if key in payload:
+                    subscribe.append((payload[key], 0))
+            self.mqtt.publish(topic, '' if remove else json.dumps(payload))
+        self.mqtt.subscribe(subscribe)
 
-    def send_to_homeassistant(self, device, room, value):
-        v_value = json.dumps(value)
-        if device == DEVICE_LIGHT:
-            self.d_mqtt.publish("{}/{}/{}/state".format(HA_PREFIX, HA_LIGHT, room), v_value)
-            logger.info("[To HA]{}/{}/{}/state = {}".format(HA_PREFIX, HA_LIGHT, room, v_value))
-        elif device == DEVICE_PLUG:
-            self.d_mqtt.publish("{}/{}/{}/state".format(HA_PREFIX, HA_SWITCH, room), v_value)
-            logger.info("[To HA]{}/{}/{}/state = {}".format(HA_PREFIX, HA_SWITCH, room, v_value))
-        elif device == DEVICE_THERMOSTAT:
-            self.d_mqtt.publish("{}/{}/{}/state".format(HA_PREFIX, HA_CLIMATE, room), v_value)
-            logger.info("[To HA]{}/{}/{}/state = {}".format(HA_PREFIX, HA_CLIMATE, room, v_value))
-        elif device == DEVICE_ELEVATOR:
-            v_value = json.dumps({device: value})
-            self.d_mqtt.publish("{}/{}/{}/state".format(HA_PREFIX, HA_SWITCH, room), v_value)
-            logger.info("[To HA]{}/{}/{}/state = {}".format(HA_PREFIX, HA_SWITCH, room, v_value))
-        elif device == DEVICE_GAS:
-            v_value = json.dumps({device: value})
-            self.d_mqtt.publish("{}/{}/{}_{}/state".format(HA_PREFIX, HA_SENSOR, room, DEVICE_GAS), v_value)
-            logger.info("[To HA]{}/{}/{}_{}/state = {}".format(HA_PREFIX, HA_SENSOR, room, DEVICE_GAS, v_value))
-            self.d_mqtt.publish("{}/{}/{}_{}/state".format(HA_PREFIX, HA_SWITCH, room, DEVICE_GAS), v_value)
-            logger.info("[To HA]{}/{}/{}_{}/state = {}".format(HA_PREFIX, HA_SWITCH, room, DEVICE_GAS, v_value))
-        elif device == DEVICE_FAN:
-            self.d_mqtt.publish("{}/{}/{}/state".format(HA_PREFIX, HA_FAN, room), v_value)
-            logger.info("[To HA]{}/{}/{}/state = {}".format(HA_PREFIX, HA_FAN, room, v_value))
+    def republish_states(self):
+        for unit in self.thermostats.values():
+            if unit.scan_tick:
+                self.publish_state(unit, {k: unit.state[k] for k in ('mode', 'target_temp', 'current_temp')})
+        if self.fan:
+            self.publish_state(self.fan, dict(self.fan.desired))
 
-    def get_serial(self, packet_name, packet_len):
-        packet = ''
-        start_flag = False
-        while True:
-            try:
-                row_data = self.read()
-                if not row_data:
-                    # 읽을 데이터가 없으면 CPU를 쓰지 않도록 잠시 대기
-                    time.sleep(0.01)
-                    if not self.connected:
-                        break
-                    continue
-                hex_d = row_data.hex()
-                start_hex = ''
-                if packet_name == 'kocom':  start_hex = 'aa'
-                if hex_d == start_hex:
-                    start_flag = True
-                if start_flag:
-                    packet += hex_d
+    def publish_state(self, unit, value):
+        topic = '{}/{}/{}/state'.format(HA_PREFIX, 'climate' if unit.kind == 'thermostat' else 'fan', unit.name)
+        payload = json.dumps(value)
+        self.mqtt.publish(topic, payload)
+        logger.info('[To HA]{} = {}'.format(topic, payload))
 
-                if len(packet) >= packet_len:
-                    chksum = self.check_sum(packet)
-                    if chksum[0]:
-                        self.tick = time.time()
-                        logger.debug("[From {}]{}".format(packet_name, packet))
-                        self.packet_parsing(packet)
-                    packet = ''
-                    start_flag = False
-            except Exception:
-                # 어떤 예외가 나도 스레드는 살아남고, 현재 패킷만 버림
-                logger.exception('[get_serial] 처리 중 예외, 패킷 버림: {}'.format(packet))
-                packet = ''
-                start_flag = False
-                time.sleep(0.1)
-            if not self.connected:
-                logger.debug('[ERROR] 서버 연결이 끊어져 get_serial Thread를 종료합니다.')
-                break
-
-    def check_sum(self, packet):
-        sum_packet = sum(bytearray.fromhex(packet)[:17])
-        v_sum = int(packet[34:36], 16) if len(packet) >= 36 else 0
-        chk_sum = '{0:02x}'.format((sum_packet + 1 + v_sum) % 256)
-        orgin_sum = packet[36:38] if len(packet) >= 38 else ''
-        return (True, chk_sum) if chk_sum == orgin_sum else (False, chk_sum)
-
-    def parse_packet(self, packet):
-        p = {}
+    def on_message(self, client, userdata, msg):
+        payload = msg.payload.decode(errors='replace')
+        parts = msg.topic.split('/')
         try:
-            p['header'] = packet[:4]
-            p['type'] = packet[4:7]
-            p['order'] = packet[7:8]
-            if KOCOM_TYPE.get(p['type']) == 'send':
-                p['dst_device'] = packet[10:12]
-                p['dst_room'] = packet[12:14]
-                p['src_device'] = packet[14:16]
-                p['src_room'] = packet[16:18]
-            elif KOCOM_TYPE.get(p['type']) == 'ack':
-                p['src_device'] = packet[10:12]
-                p['src_room'] = packet[12:14]
-                p['dst_device'] = packet[14:16]
-                p['dst_room'] = packet[16:18]
-            p['command'] = packet[18:20]
-            p['value'] = packet[20:36]
-            p['checksum'] = packet[36:38]
-            p['tail'] = packet[38:42]
-            return p
-        except:
-            return False
+            if msg.topic.startswith(BRIDGE_TOPIC + '/'):
+                self.on_bridge(parts[3], payload)
+            elif msg.topic == HA_STATUS_TOPIC:
+                if payload == 'online':  # HA 재시작: 엔티티 등록과 현재 상태를 다시 보냄
+                    logger.info('[From HA]HomeAssistant online')
+                    self.discovery()
+                    self.republish_states()
+            elif len(parts) == 4 and parts[0] == HA_PREFIX and parts[1] == 'climate':
+                self.on_climate(parts[2], parts[3], payload)
+            elif len(parts) == 4 and parts[0] == HA_PREFIX and parts[1] == 'fan':
+                self.on_fan(parts[3], payload)
+        except Exception:
+            logger.exception('[From HA]Error {} = {}'.format(msg.topic, payload))
 
-    def value_packet(self, p):
-        v = {}
-        if not p:
-            return False
-        try:
-            v['type'] = KOCOM_TYPE.get(p['type'])
-            v['command'] = KOCOM_COMMAND.get(p['command'])
-            v['src_device'] = KOCOM_DEVICE.get(p['src_device'])
-            v['src_room'] = KOCOM_ROOM.get(p['src_room']) if v['src_device'] != DEVICE_THERMOSTAT else KOCOM_ROOM_THERMOSTAT.get(p['src_room'])
-            v['dst_device'] = KOCOM_DEVICE.get(p['dst_device'])
-            v['dst_room'] = KOCOM_ROOM.get(p['dst_room']) if v['src_device'] != DEVICE_THERMOSTAT else KOCOM_ROOM_THERMOSTAT.get(p['dst_room'])
-            v['value'] = p['value']
-            if v['src_device'] == DEVICE_FAN:
-                v['value'] = self.parse_fan(p['value'])
-            elif v['src_device'] == DEVICE_LIGHT or v['src_device'] == DEVICE_PLUG:
-                v['value'] = self.parse_switch(v['src_device'], v['src_room'], p['value'])
-            elif v['src_device'] == DEVICE_THERMOSTAT:
-                v['value'] = self.parse_thermostat(p['value'], self.wp_list[v['src_device']][v['src_room']]['target_temp']['state'])
-            elif v['src_device'] == DEVICE_WALLPAD and v['dst_device'] == DEVICE_ELEVATOR:
-                v['value'] = 'off'
-            elif v['src_device'] == DEVICE_GAS:
-                v['value'] = v['command']
-            return v
-        except:
-            return False
-
-    def packet_parsing(self, packet, name='kocom', from_to='From'):
-        p = self.parse_packet(packet)
-        v = self.value_packet(p)
-
-        try:
-            if v['command'] == "조회" and v['src_device'] == DEVICE_WALLPAD:
-                if name == 'HA':
-                    self.write(self.make_packet(v['dst_device'], v['dst_room'], '조회', '', ''))
-                logger.debug('[{} {}]{}({}) {}({}) -> {}({})'.format(from_to, name, v['type'], v['command'], v['src_device'], v['src_room'], v['dst_device'], v['dst_room']))
-            else:
-                logger.debug('[{} {}]{}({}) {}({}) -> {}({}) = {}'.format(from_to, name, v['type'], v['command'], v['src_device'], v['src_room'], v['dst_device'], v['dst_room'], v['value']))
-            
-            if (v['type'] == 'ack' and v['src_device'] == DEVICE_THERMOSTAT) or (v['type'] == 'send' and v['dst_device'] == DEVICE_ELEVATOR):
-                if v['type'] == 'send' and v['dst_device'] == DEVICE_ELEVATOR:
-                    self.set_list(v['dst_device'], DEVICE_WALLPAD, v['value'])
-                    self.send_to_homeassistant(v['dst_device'], DEVICE_WALLPAD, v['value'])
-                elif v['src_device'] == DEVICE_FAN or v['src_device'] == DEVICE_GAS:
-                    self.set_list(v['src_device'], DEVICE_WALLPAD, v['value'])
-                    self.send_to_homeassistant(v['src_device'], DEVICE_WALLPAD, v['value'])
-                elif v['src_device'] == DEVICE_THERMOSTAT or v['src_device'] == DEVICE_LIGHT or v['src_device'] == DEVICE_PLUG:
-                    self.set_list(v['src_device'], v['src_room'], v['value'])
-                    self.send_to_homeassistant(v['src_device'], v['src_room'], v['value'])
-        except:
-            logger.info('[{} {}]Error {}'.format(from_to, name, packet))
-
-    def set_list(self, device, room, value, name='kocom'):
-        try:
-            logger.info('[From {}]{}/{}/state = {}'.format(name, device, room, value))
-            if 'scan' in self.wp_list[device][room] and type(self.wp_list[device][room]['scan']) == dict:
-                self.wp_list[device][room]['scan']['tick'] = time.time()
-                self.wp_list[device][room]['scan']['count'] = 0
-                self.wp_list[device][room]['scan']['last'] = 0
-            if device == DEVICE_GAS or device == DEVICE_ELEVATOR:
-                self.wp_list[device][room][device]['state'] = value
-                self.wp_list[device][room][device]['last'] = 'state'
-                self.wp_list[device][room][device]['count'] = 0
-            elif device == DEVICE_FAN:
-                for sub, v in value.items():
-                    try:
-                        if sub == 'mode':
-                            self.wp_list[device][room][sub]['state'] = v
-                            self.wp_list[device][room]['speed']['state'] = 'off' if v == 'off' else DEFAULT_SPEED
-                        else:
-                            self.wp_list[device][room][sub]['state'] = v
-                            self.wp_list[device][room]['mode']['state'] = 'off' if v == 'off' else 'on'
-                        if (self.wp_list[device][room][sub]['last'] == 'set' or type(self.wp_list[device][room][sub]['last']) == float) and self.wp_list[device][room][sub]['set'] == self.wp_list[device][room][sub]['state']:
-                            self.wp_list[device][room][sub]['last'] = 'state'
-                            self.wp_list[device][room][sub]['count'] = 0
-                    except:
-                        logger.info('[From {}]Error SetListDevice {}/{}/{}/state = {}'.format(name, device, room, sub, v))
-            elif device == DEVICE_LIGHT or device == DEVICE_PLUG:
-                for sub, v in value.items():
-                    try:
-                        self.wp_list[device][room][sub]['state'] = v
-                        if (self.wp_list[device][room][sub]['last'] == 'set' or type(self.wp_list[device][room][sub]['last']) == float) and self.wp_list[device][room][sub]['set'] == self.wp_list[device][room][sub]['state']:
-                            self.wp_list[device][room][sub]['last'] = 'state'
-                            self.wp_list[device][room][sub]['count'] = 0
-                    except:
-                        logger.info('[From {}]Error SetListDevice {}/{}/{}/state = {}'.format(name, device, room, sub, v))
-            elif device == DEVICE_THERMOSTAT:
-                for sub, v in value.items():
-                    try:
-                        if sub == 'mode':
-                            self.wp_list[device][room][sub]['state'] = v
-                        else:
-                            self.wp_list[device][room][sub]['state'] = int(float(v))
-                            self.wp_list[device][room]['mode']['state'] = 'heat'
-                        if (self.wp_list[device][room][sub]['last'] == 'set' or type(self.wp_list[device][room][sub]['last']) == float) and self.wp_list[device][room][sub]['set'] == self.wp_list[device][room][sub]['state']:
-                            self.wp_list[device][room][sub]['last'] = 'state'
-                            self.wp_list[device][room][sub]['count'] = 0
-                    except:
-                        logger.info('[From {}]Error SetListDevice {}/{}/{}/state = {}'.format(name, device, room, sub, v))
-        except:
-            logger.info('[From {}]Error SetList {}/{} = {}'.format(name, device, room, value))
-
-    def scan_list(self):
-        while True:
-            if not self.kocom_scan:
-                now = time.time()
-                if now - self.tick > KOCOM_INTERVAL / 1000:
-                    try:
-                        for device, d_list in self.wp_list.items():
-                            if type(d_list) == dict and ((device == DEVICE_ELEVATOR and self.wp_elevator) or (device == DEVICE_FAN and self.wp_fan) or (device == DEVICE_GAS and self.wp_gas) or (device == DEVICE_LIGHT and self.wp_light) or (device == DEVICE_PLUG and self.wp_plug) or (device == DEVICE_THERMOSTAT and self.wp_thermostat)):
-                                for room, r_list in d_list.items():
-                                    if type(r_list) == dict:
-                                        if 'scan' in r_list and type(r_list['scan']) == dict and now - r_list['scan']['tick'] > SCAN_INTERVAL and ((device == DEVICE_FAN and self.wp_fan) or (device == DEVICE_GAS and self.wp_gas) or (device == DEVICE_LIGHT and self.wp_light) or (device == DEVICE_PLUG and self.wp_plug) or (device == DEVICE_THERMOSTAT and self.wp_thermostat)):
-                                            if now - r_list['scan']['last'] > 2:
-                                                r_list['scan']['count'] += 1
-                                                r_list['scan']['last'] = now
-                                                self.set_serial(device, room, '', '', cmd='조회')
-                                                time.sleep(SCANNING_INTERVAL)
-                                            if r_list['scan']['count'] > 4:
-                                                r_list['scan']['tick'] = now
-                                                r_list['scan']['count'] = 0
-                                                r_list['scan']['last'] = 0
-                                        else:
-                                            for sub_d, sub_v in r_list.items():
-                                                if sub_d != 'scan':
-                                                    if sub_v['count'] > 4:
-                                                        sub_v['count'] = 0
-                                                        sub_v['last'] = 'state'
-                                                    elif sub_v['last'] == 'set':
-                                                        sub_v['last'] = now
-                                                        if device == DEVICE_GAS:
-                                                            sub_v['last'] += 5
-                                                        elif device == DEVICE_ELEVATOR:
-                                                            sub_v['last'] = 'state'
-                                                        self.set_serial(device, room, sub_d, sub_v['set'])
-                                                    elif type(sub_v['last']) == float and now - sub_v['last'] > 1:
-                                                        sub_v['last'] = 'set' 
-                                                        sub_v['count'] += 1
-                    except:
-                        logger.debug('[Scan]Error')
-            if not self.connected:
-                logger.debug('[ERROR] 서버 연결이 끊어져 scan_list Thread를 종료합니다.')
-                break
-            time.sleep(0.2)
-
-    def set_serial(self, device, room, target, value, cmd='상태'):
-        if (time.time() - self.tick) < KOCOM_INTERVAL / 1000:
+    def on_climate(self, room, command, payload):
+        unit = self.thermostats.get(room)
+        if unit is None or command not in ('mode', 'target_temp'):
             return
-        if cmd == '상태':
-            logger.info('[To {}]{}/{}/{} -> {}'.format(self._name, device, room, target, value))
-        elif cmd == '조회':
-            logger.info('[To {}]{}/{} -> 조회'.format(self._name, device, room))
-        packet = self.make_packet(device, room, '상태', target, value) if cmd == '상태' else  self.make_packet(device, room, '조회', '', '')
-        v = self.value_packet(self.parse_packet(packet))
+        with self.lock:
+            if command == 'target_temp':
+                unit.request(target_temp=int(float(payload)), mode='heat')
+            elif payload in THERMO_MODES:
+                unit.request(mode=payload)
+            else:
+                logger.warning('[From HA]지원하지 않는 난방 모드: {}'.format(payload))
+                return
+            ha = {'mode': unit.desired['mode'], 'target_temp': unit.desired['target_temp'],
+                  'current_temp': unit.state['current_temp']}
+        logger.info('[From HA]thermostat/{}/set = [mode={}, target_temp={}]'.format(room, ha['mode'], ha['target_temp']))
+        self.publish_state(unit, ha)  # 월패드 응답을 기다리지 않고 HA에 먼저 반영
 
-        logger.debug('[To {}]{}'.format(self._name, packet))
-        if v['command'] == "조회" and v['src_device'] == DEVICE_WALLPAD:
-            logger.debug('[To {}]{}({}) {}({}) -> {}({})'.format(self._name, v['type'], v['command'], v['src_device'], v['src_room'], v['dst_device'], v['dst_room']))
-        else:
-            logger.debug('[To {}]{}({}) {}({}) -> {}({}) = {}'.format(self._name, v['type'], v['command'], v['src_device'], v['src_room'], v['dst_device'], v['dst_room'], v['value']))
-        if device == DEVICE_ELEVATOR:
-            self.send_to_homeassistant(DEVICE_ELEVATOR, DEVICE_WALLPAD, 'on')
-        if device == DEVICE_FAN:
-            if v['command'] == '상태' and v['value'] == '0001000000000000':
-                packet = 'AAE10120020201006B55AA01E12082020100EB55'
-                logger.debug('fan OFF packet = {}'.format(packet))
-            elif v['command'] == '상태' and v['value'] == '1100800000000000':
-                packet = 'AAE10120020202036B55AA01E12082020203EB55'
-                logger.debug('fan ON packet = {}'.format(packet))
-            else :
-                logger.debug('Value = {}'.format(v['value']))
-                logger.debug('fan STATUS packet = {}'.format(packet))
-        self.write(packet)
+    def on_fan(self, command, payload):
+        if self.fan is None:
+            return
+        with self.lock:
+            if command == 'speed' and payload in FAN_SPEED_CODE:
+                self.fan.request(speed=payload, mode='on')
+            elif command == 'mode' and payload in ('on', 'off'):
+                self.fan.request(mode=payload, speed=self.default_speed if payload == 'on' else 'off')
+            else:
+                logger.warning('[From HA]지원하지 않는 환기 명령: {} = {}'.format(command, payload))
+                return
+            ha = dict(self.fan.desired)
+        logger.info('[From HA]fan/wallpad/set = [mode={}, speed={}]'.format(ha['mode'], ha['speed']))
+        self.publish_state(self.fan, ha)
 
-    def make_packet(self, device, room, cmd, target, value):
-        p_header = 'aa5530bc00'
-        p_device = KOCOM_DEVICE_REV.get(device)
-        p_room = KOCOM_ROOM_REV.get(room) if device != DEVICE_THERMOSTAT else  KOCOM_ROOM_THERMOSTAT_REV.get(room)
-        p_dst = KOCOM_DEVICE_REV.get(DEVICE_WALLPAD) + KOCOM_ROOM_REV.get(DEVICE_WALLPAD)
-        p_cmd = KOCOM_COMMAND_REV.get(cmd)
-        p_value = ''
-        if cmd == '조회':
-            p_value = '0000000000000000'
-        else:
-            if device == DEVICE_ELEVATOR:
-                p_device = KOCOM_DEVICE_REV.get(DEVICE_WALLPAD)
-                p_room = KOCOM_ROOM_REV.get(DEVICE_WALLPAD)
-                p_dst = KOCOM_DEVICE_REV.get(device) + KOCOM_ROOM_REV.get(DEVICE_WALLPAD)
-                p_cmd = KOCOM_COMMAND_REV.get('on')
-                p_value = '0000000000000000'
-            elif device == DEVICE_GAS:
-                p_cmd = KOCOM_COMMAND_REV.get('off')
-                p_value = '0000000000000000'
-            elif device == DEVICE_LIGHT or device == DEVICE_PLUG:
-                try:
-                    all_device = device + str('0')
-                    for i in range(1,9):
-                        sub_device = device + str(i)
-                        if target != sub_device:
-                            if target == all_device:
-                                if sub_device in self.wp_list[device][room]:
-                                    p_value += 'ff' if value == 'on' else str('00')
-                                else:
-                                    p_value += '00'
-                            else:
-                                if sub_device in self.wp_list[device][room] and self.wp_list[device][room][sub_device]['state'] == 'on':
-                                    p_value += 'ff'
-                                else:
-                                    p_value += '00'
-                        else:
-                            p_value += 'ff' if value == 'on' else str('00')
-                except:
-                    logger.debug('[Make Packet] Error on DEVICE_LIGHT or DEVICE_PLUG')
-            elif device == DEVICE_THERMOSTAT:
-                try:
-                    mode = self.wp_list[device][room]['mode']['set']
-                    target_temp = self.wp_list[device][room]['target_temp']['set']
-                    if mode == 'heat':
-                        p_value += '1100'
-                    elif mode == 'off':
-                        # p_value += '0001'
-                        p_value += '0100'
-                    else:
-                        p_value += '1101'
-                    p_value += '{0:02x}'.format(int(float(target_temp)))
-                    p_value += '0000000000'
-                except:
-                    logger.debug('[Make Packet] Error on DEVICE_THERMOSTAT')
-            elif device == DEVICE_FAN:
-                try:
-                    mode = self.wp_list[device][room]['mode']['set']
-                    speed = self.wp_list[device][room]['speed']['set']
-                    if mode == 'on':
-                        p_value += '1100'
-                    elif mode == 'off':
-                        p_value += '0001'
-                    p_value += KOCOM_FAN_SPEED_REV.get(speed)
-                    p_value += '00000000000'
-                except:
-                    logger.debug('[Make Packet] Error on DEVICE_THERMOSTAT')
-        if p_value != '':
-            packet = p_header + p_device + p_room + p_dst + p_cmd + p_value
-            chk_sum = self.check_sum(packet)[1]
-            packet += chk_sum + '0d0d'
-            return packet
-        return False
+    def on_bridge(self, command, payload):
+        '''rs485/bridge/config/<command> 로 보내는 디버그용 명령'''
+        logger.info('[From HA]{}/{} = {}'.format(BRIDGE_TOPIC, command, payload))
+        if command == 'log_level':
+            levels = {'debug': logging.DEBUG, 'info': logging.INFO, 'warn': logging.WARNING}
+            if payload in levels:
+                logger.setLevel(levels[payload])
+        elif command == 'restart':
+            self.discovery()
+            self.republish_states()
+        elif command == 'remove':
+            self.discovery(remove=True)
+        elif command == 'scan':
+            with self.lock:
+                for unit in self.units():
+                    unit.reset_scan()
+        elif command == 'packet':
+            # 받은 것처럼 처리. 월패드->장치 조회 패킷이면 실제로 버스에 전송
+            packet = payload.strip().lower().replace(' ', '')
+            if len(packet) < PACKET_HEX_LEN:
+                logger.warning('[From HA]패킷 길이 오류: {}'.format(packet))
+                return
+            self.handle_packet(packet, source='HA')
+            frame = parse_frame(packet)
+            if frame and frame.cmd == CMD_QUERY and frame.src_dev == DEV_WALLPAD:
+                self.last_activity = time.time()
+                self.transport.write(bytes.fromhex(packet))
+        elif command == 'check_sum':
+            packet = payload.strip().lower()
+            logger.info('[From HA]{} = {}({})'.format(packet, is_valid(packet), checksum(packet)))
 
-    def parse_fan(self, value='0000000000000000'):
-        fan = {}
-        fan['mode'] = 'on' if value[:2] == '11' else 'off'
-        fan['speed'] = KOCOM_FAN_SPEED.get(value[4:5])
-        return fan
+###############################################################################
+def setup_logging(level_name):
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s : Line %(lineno)s - %(message)s')
+    file_handler = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=1024 * 1024, backupCount=10, encoding='utf-8')
+    stream_handler = logging.StreamHandler()  # HA 애드온 로그 화면에 표시
+    for handler in (file_handler, stream_handler):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    levels = {'debug': logging.DEBUG, 'info': logging.INFO, 'warn': logging.WARNING}
+    logger.setLevel(levels.get(level_name, logging.INFO))
 
-    def parse_switch(self, device, room, value='0000000000000000'):
-        switch = {}
-        on_count = 0
-        to_i = KOCOM_LIGHT_SIZE.get(room) + 1 if device == DEVICE_LIGHT else KOCOM_PLUG_SIZE.get(room) + 1
-        for i in range(1, to_i):
-            switch[device + str(i)] = 'off' if value[i*2-2:i*2] == '00' else 'on'
-            if value[i*2-2:i*2] != '00':
-                on_count += 1
-        switch[device + str('0')] = 'on' if on_count > 0 else 'off'
-        return switch
 
-    def parse_thermostat(self, value='0000000000000000', init_temp=False):
-        thermo = {}
-        heat_mode = 'heat' if value[:2] == '11' else 'off'
-        away_mode = 'on' if value[2:4] == '01' else 'off'
-        thermo['current_temp'] = int(value[8:10], 16)
-        if heat_mode == 'heat' and away_mode == 'on':
-            thermo['mode'] = 'fan_only'
-            thermo['target_temp'] = INIT_TEMP if not init_temp else int(init_temp)
-        elif heat_mode == 'heat' and away_mode == 'off':
-            thermo['mode'] = 'heat'
-            thermo['target_temp'] = int(value[4:6], 16)
-        elif heat_mode == 'off':
-            thermo['mode'] = 'off'
-            thermo['target_temp'] = INIT_TEMP if not init_temp else int(init_temp)
-        return thermo
+def main():
+    cfg = load_config()
+    setup_logging(str(cfg['Advanced'].get('LOGLEVEL', 'info')).lower())
+    logger.info('{} 시작'.format(SW_VERSION))
+    transport = Transport(cfg)
+    if transport.kind not in ('socket', 'serial'):
+        logger.error('[Config] RS485 type은 Serial 또는 Socket 이어야 합니다: {}'.format(transport.kind))
+        return 1
+    Kocom(cfg, transport).run()
+
 
 if __name__ == '__main__':
-    #logger 인스턴스 생성 및 로그레벨 설정
-    logger = logging.getLogger(CONF_LOGNAME)
-    logger.setLevel(logging.INFO)
-    if CONF_LOGLEVEL == "info": logger.setLevel(logging.INFO)
-    if CONF_LOGLEVEL == "debug": logger.setLevel(logging.DEBUG)
-    if CONF_LOGLEVEL == "warn": logger.setLevel(logging.WARN)
-
-    # formatter 생성
-    logFormatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s : Line %(lineno)s - %(message)s')
-
-    # fileHandler, StreamHandler 생성
-    file_max_bytes = 100 * 1024 * 10 # 1 MB 사이즈
-    logFileHandler = logging.handlers.RotatingFileHandler(filename=log_path, maxBytes=file_max_bytes, backupCount=10, encoding='utf-8')
-    logStreamHandler = logging.StreamHandler()
-
-    # handler 에 formatter 설정
-    logFileHandler.setFormatter(logFormatter)
-    logStreamHandler.setFormatter(logFormatter)
-    logFileHandler.suffix = "%Y%m%d"
-
-    logger.addHandler(logFileHandler)
-    #logger.addHandler(logStreamHandler)
- 
-    logging.info('{} 시작'.format(SW_VERSION))
-    logger.info('{} 시작'.format(SW_VERSION))
-
-    if DEFAULT_SPEED not in ['low', 'medium', 'high']:
-        logger.info('[Error] DEFAULT_SPEED 설정오류로 medium 으로 설정. {} -> medium'.format(DEFAULT_SPEED))
-        DEFAULT_SPEED = 'medium'
-
-    connection_flag = False
-    while not connection_flag:
-        r = rs485()
-        connection_flag = True
-        if r._type == 'serial':
-            for device in r._device:
-                if r._connect[device].isOpen():
-                    _name = r._device[device]
-                    try:
-                        logger.info('[CONFIG] {} 초기화'.format(_name))
-                        if _name == 'kocom':
-                            kocom = Kocom(r, _name, device, 42)
-                    except:
-                        logger.info('[CONFIG] {} 초기화 실패'.format(_name))
-        elif r._type == 'socket':
-            _name = r._device
-            if _name == 'kocom':
-                kocom = Kocom(r, _name, _name, 42)
-                if not kocom.connection_lost():
-                    logger.info('[ERROR] 서버 연결이 끊어져 1분 후 재접속을 시도합니다.')
-                    time.sleep(60)
-                    connection_flag = False
-            
+    raise SystemExit(main() or 0)
