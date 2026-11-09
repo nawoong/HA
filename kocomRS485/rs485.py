@@ -37,7 +37,7 @@ try:
 except ImportError:  # 소켓만 쓰는 경우 pyserial 없어도 동작
     serial = None
 
-SW_VERSION = 'RS485 Compilation 1.2.2'
+SW_VERSION = 'RS485 Compilation 1.2.3'
 
 ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
 OPTIONS_FILE = '/data/options.json'
@@ -294,7 +294,7 @@ class Unit:
     state   : 월패드에서 확인한 상태
     desired : HA가 요청한 상태. pending이면 월패드에 반영될 때까지(최대 MAX_SENDS회) 전송'''
 
-    def __init__(self, kind, name, device, room_code, state, needs_ack):
+    def __init__(self, kind, name, device, room_code, state, needs_ack, scan=True):
         self.kind = kind            # 'thermostat' | 'fan'
         self.name = name            # HA 토픽에 쓰이는 이름 (livingroom, wallpad ...)
         self.device = device
@@ -302,6 +302,7 @@ class Unit:
         self.state = dict(state)
         self.desired = dict(state)
         self.needs_ack = needs_ack  # False면 응답 확인 없이 MAX_SENDS회 전송
+        self.scan = scan            # False면 SCAN_INTERVAL마다 조회 패킷을 보내지 않음
         self.pending = False
         self.sends = 0
         self.sent_at = 0.0
@@ -353,8 +354,10 @@ class Kocom:
                     {'mode': 'off', 'current_temp': 0, 'target_temp': self.init_temp}, needs_ack=True)
         self.fan = None
         if to_bool(cfg['Wallpad'].get('fan')):
-            # 전용 패킷(FAN_RAW_PACKETS)에 대한 응답은 해석할 수 없으므로 응답 확인 없이 반복 전송
-            self.fan = Unit('fan', 'wallpad', DEV_FAN, FAN_ROOM, {'mode': 'off', 'speed': 'off'}, needs_ack=False)
+            # 전용 패킷(FAN_RAW_PACKETS)에 대한 응답은 해석할 수 없으므로 응답 확인 없이 반복 전송.
+            # 표준 조회 패킷(aa5530bc0048...3a)을 받으면 환기장치가 꺼지므로 조회하지 않는다.
+            self.fan = Unit('fan', 'wallpad', DEV_FAN, FAN_ROOM, {'mode': 'off', 'speed': 'off'},
+                            needs_ack=False, scan=False)
 
         self.mqtt_conf = cfg['MQTT']
         self.mqtt = self.make_mqtt(self.mqtt_conf)
@@ -446,7 +449,7 @@ class Kocom:
             now = time.time()
             if now - self.last_activity < BUS_IDLE_SEC:
                 return  # 버스 사용 중. 다음 주기에 이어서
-            if now - unit.scan_tick > self.scan_interval:
+            if unit.scan and now - unit.scan_tick > self.scan_interval:
                 # 상태 확인할 때가 됨: 응답이 올 때까지 SCAN_RETRY_SEC 간격으로 최대 MAX_SCANS회 조회
                 if now - unit.scan_sent_at > SCAN_RETRY_SEC:
                     unit.scans += 1
