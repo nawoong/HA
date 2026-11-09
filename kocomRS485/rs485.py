@@ -37,7 +37,7 @@ try:
 except ImportError:  # 소켓만 쓰는 경우 pyserial 없어도 동작
     serial = None
 
-SW_VERSION = 'RS485 Compilation 1.2.4'
+SW_VERSION = 'RS485 Compilation 1.2.5'
 
 ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
 OPTIONS_FILE = '/data/options.json'
@@ -60,12 +60,12 @@ COMMAND_NAMES = {'3a': '조회', '00': '상태', '01': 'on', '02': 'off'}
 TYPE_NAMES = {'30b': 'send', '30d': 'ack'}
 EMPTY_VALUE = '0' * 16
 
-# 내부 모드: off / heat / away(외출). HA에는 off·heat 모드 + away 프리셋으로 보인다.
+# 내부 모드: off / heat / away(외출). HA에는 외출이 fan_only 모드로 보인다.
 # off는 '0001': 월패드에서 직접 껐을 때 온도조절기가 보고한 값. '0100'은 ACK만 오고 꺼지지 않음
 THERMO_MODE_CODE = {'heat': '1100', 'off': '0001', 'away': '1101'}
-HA_HVAC_MODES = ('off', 'heat')
-HA_PRESET_AWAY = 'away'
-HA_PRESET_NONE = 'none'
+HA_HVAC_MODES = ('off', 'heat', 'fan_only')
+HA_MODE_FROM = {'off': 'off', 'heat': 'heat', 'away': 'fan_only'}   # 내부 -> HA
+HA_MODE_TO = {v: k for k, v in HA_MODE_FROM.items()}                 # HA -> 내부
 THERMO_MIN_TEMP = 10
 THERMO_MAX_TEMP = 30
 
@@ -193,10 +193,8 @@ def parse_thermostat(value, prev_target, init_temp):
 
 
 def ha_thermostat_state(mode, target_temp, current_temp):
-    '''내부 모드(off/heat/away) -> HA climate 상태. 외출은 난방 모드 + away 프리셋.'''
-    return {'mode': 'off' if mode == 'off' else 'heat',
-            'preset': HA_PRESET_AWAY if mode == 'away' else HA_PRESET_NONE,
-            'target_temp': target_temp, 'current_temp': current_temp}
+    '''내부 모드(off/heat/away) -> HA climate 상태. 외출은 fan_only.'''
+    return {'mode': HA_MODE_FROM[mode], 'target_temp': target_temp, 'current_temp': current_temp}
 
 ###############################################################################
 # 연결
@@ -569,10 +567,6 @@ class Kocom:
                 'temp_stat_tpl': '{{ value_json.target_temp }}',
                 'curr_temp_t': base + '/state',
                 'curr_temp_tpl': '{{ value_json.current_temp }}',
-                'pr_mode_cmd_t': base + '/preset',
-                'pr_mode_stat_t': base + '/state',
-                'pr_mode_val_tpl': '{{ value_json.preset }}',
-                'pr_modes': [HA_PRESET_AWAY],
                 'min_temp': THERMO_MIN_TEMP,
                 'max_temp': THERMO_MAX_TEMP,
                 'temp_step': 1,
@@ -585,7 +579,7 @@ class Kocom:
     def discovery(self, remove=False):
         subscribe = [(BRIDGE_TOPIC + '/#', 0), (HA_STATUS_TOPIC, 0)]
         for topic, payload in self.discovery_configs():
-            for key in ('cmd_t', 'spd_cmd_t', 'mode_cmd_t', 'temp_cmd_t', 'pr_mode_cmd_t'):
+            for key in ('cmd_t', 'spd_cmd_t', 'mode_cmd_t', 'temp_cmd_t'):
                 if key in payload:
                     subscribe.append((payload[key], 0))
             self.mqtt.publish(topic, '' if remove else json.dumps(payload))
@@ -625,22 +619,15 @@ class Kocom:
 
     def on_climate(self, room, command, payload):
         unit = self.thermostats.get(room)
-        if unit is None or command not in ('mode', 'target_temp', 'preset'):
+        if unit is None or command not in ('mode', 'target_temp'):
             return
         with self.lock:
             if command == 'target_temp':
                 unit.request(target_temp=int(float(payload)), mode='heat')
-            elif command == 'mode' and payload in HA_HVAC_MODES:
-                unit.request(mode=payload)
-            elif command == 'mode' and payload == 'fan_only':  # 1.2.3 이하의 외출 모드 (기존 자동화 호환)
-                unit.request(mode='away')
-            elif command == 'preset' and payload == HA_PRESET_AWAY:
-                unit.request(mode='away')
-            elif command == 'preset' and payload == HA_PRESET_NONE:
-                if unit.desired['mode'] == 'away':  # 외출 해제 -> 난방. 꺼져 있으면 그대로
-                    unit.request(mode='heat')
+            elif payload in HA_MODE_TO:
+                unit.request(mode=HA_MODE_TO[payload])
             else:
-                logger.warning('[From HA]지원하지 않는 난방 명령: {} = {}'.format(command, payload))
+                logger.warning('[From HA]지원하지 않는 난방 모드: {}'.format(payload))
                 return
             d = unit.desired
             ha = ha_thermostat_state(d['mode'], d['target_temp'], unit.state['current_temp'])
