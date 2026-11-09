@@ -123,11 +123,6 @@ KOCOM_ROOM_REV[DEVICE_WALLPAD] = '00'
 
 # KOCOM TIME 변수
 KOCOM_INTERVAL = 100
-VENTILATOR_INTERVAL = 150
-
-# GREX 그렉스 전열교환기 패킷 기본정보
-GREX_MODE                   = {'0100': 'auto', '0200': 'manual', '0300': 'sleep', '0000': 'off'}
-GREX_SPEED                  = {'0101': 'low', '0202': 'medium', '0303': 'high', '0000': 'off'}
 
 # CONFIG 파일 변수값
 CONF_FILE = 'rs485.conf'
@@ -272,7 +267,14 @@ class rs485:
         except Exception as e:
             logger.info('소켓에 연결할 수 없습니다.[{}][{}:{}]'.format(e, server, port))
             return False
-        soc.settimeout(None)
+        # TCP keepalive: 변환기가 조용히 죽어도(전원/WiFi 끊김) 약 1분 내에 recv()가 에러를 냄
+        soc.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, 'TCP_KEEPIDLE'):
+            soc.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+            soc.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            soc.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        # 무한 대기 대신 1초마다 깨어나 연결 상태(self.connected)를 확인할 수 있게 함
+        soc.settimeout(1.0)
         return soc
 
 class Kocom(rs485):
@@ -322,6 +324,9 @@ class Kocom(rs485):
                             self.wp_list[d_name][r_name][d_name + str(i)] = {'state': 'on', 'set': 'on', 'last': 'state', 'count': 0}
 
         self.d_type = client._type
+        self.device = device
+        self.read_error_log_tick = 0
+        self.reconnect_tick = 0
         if self.d_type == "serial":
             self.d_serial = client._connect[device]
         elif self.d_type == "socket":
@@ -338,21 +343,77 @@ class Kocom(rs485):
         self._t2.join()
         if not self.connected:
             logger.debug('[ERROR] 서버 연결이 끊어져 kocom 클래스를 종료합니다.')
+            # 재접속 시 새 Kocom 인스턴스가 만들어지므로 기존 MQTT/소켓 정리
+            try:
+                if self.d_mqtt:
+                    self.d_mqtt.loop_stop()
+                    self.d_mqtt.disconnect()
+            except Exception:
+                pass
+            try:
+                self.d_serial.close()
+            except Exception:
+                pass
             return False
 
     def read(self):
+        # 항상 bytes를 반환해야 get_serial()에서 .hex() 호출이 실패하지 않음
         if self.client._connect == False:
-            return ''
+            if self.d_type == 'socket':
+                # 최초 소켓 연결 실패: 메인 루프가 재접속하도록 종료 신호
+                self.connected = False
+            return b''
         try:
             if self.d_type == 'serial':
                 if self.d_serial.readable():
                     return self.d_serial.read()
-                else:
-                    return ''
+                return b''
             elif self.d_type == 'socket':
-                return self.d_serial.recv(1)
-        except:
-            logging.info('[Serial Read] Connection Error')
+                try:
+                    data = self.d_serial.recv(1)
+                except socket.timeout:
+                    # 1초 동안 들어온 데이터가 없을 뿐, 에러 아님
+                    return b''
+                if not data:
+                    # recv()가 빈 값이면 상대가 연결을 닫은 것
+                    raise ConnectionError('socket closed by peer')
+                return data
+        except Exception as e:
+            self.handle_read_error(e)
+        return b''
+
+    def handle_read_error(self, e):
+        now = time.time()
+        # 같은 에러가 반복되면 10초에 한 번만 기록
+        if now - self.read_error_log_tick > 10:
+            logger.warning('[Serial Read] Connection Error: {}'.format(e))
+            self.read_error_log_tick = now
+        if self.d_type == 'socket':
+            # 메인 루프가 60초 후 새 소켓으로 재접속
+            self.connected = False
+        elif self.d_type == 'serial':
+            self.reconnect_serial()
+
+    def reconnect_serial(self):
+        now = time.time()
+        if now - self.reconnect_tick < 5:
+            time.sleep(0.5)
+            return
+        self.reconnect_tick = now
+        port = self.client._port_url.get(self.device)
+        try:
+            self.d_serial.close()
+        except Exception:
+            pass
+        try:
+            ser = serial.Serial(port, 9600, timeout=None)
+            ser.bytesize = 8
+            ser.stopbits = 1
+            self.d_serial = ser
+            self.client._con[self.device] = ser
+            logger.warning('[Serial] 재연결 성공 [{}]'.format(port))
+        except Exception as e:
+            logger.warning('[Serial] 재연결 실패 [{}]: {}'.format(port, e))
 
     def write(self, data):
         if data == False:
@@ -364,9 +425,12 @@ class Kocom(rs485):
             if self.d_type == 'serial':
                 return self.d_serial.write(bytearray.fromhex((data)))
             elif self.d_type == 'socket':
-                return self.d_serial.send(bytearray.fromhex((data)))
-        except:
-            logging.info('[Serial Write] Connection Error')
+                return self.d_serial.sendall(bytearray.fromhex((data)))
+        except Exception as e:
+            logger.warning('[Serial Write] Connection Error: {}'.format(e))
+            if self.d_type == 'socket':
+                # 송신 실패도 연결 끊김으로 보고 메인 루프 재접속을 유도
+                self.connected = False
 
     def connect_mqtt(self, server, name):
         mqtt_client = mqtt.Client()
@@ -777,25 +841,36 @@ class Kocom(rs485):
         packet = ''
         start_flag = False
         while True:
-            row_data = self.read()
-            hex_d = row_data.hex()
-            start_hex = ''
-            if packet_name == 'kocom':  start_hex = 'aa'
-            elif packet_name == 'grex_ventilator':  start_hex = 'd1'
-            elif packet_name == 'grex_controller':  start_hex = 'd0'
-            if hex_d == start_hex:
-                start_flag = True
-            if start_flag:
-                packet += hex_d
+            try:
+                row_data = self.read()
+                if not row_data:
+                    # 읽을 데이터가 없으면 CPU를 쓰지 않도록 잠시 대기
+                    time.sleep(0.01)
+                    if not self.connected:
+                        break
+                    continue
+                hex_d = row_data.hex()
+                start_hex = ''
+                if packet_name == 'kocom':  start_hex = 'aa'
+                if hex_d == start_hex:
+                    start_flag = True
+                if start_flag:
+                    packet += hex_d
 
-            if len(packet) >= packet_len:
-                chksum = self.check_sum(packet)
-                if chksum[0]:
-                    self.tick = time.time()
-                    logger.debug("[From {}]{}".format(packet_name, packet))
-                    self.packet_parsing(packet)
+                if len(packet) >= packet_len:
+                    chksum = self.check_sum(packet)
+                    if chksum[0]:
+                        self.tick = time.time()
+                        logger.debug("[From {}]{}".format(packet_name, packet))
+                        self.packet_parsing(packet)
+                    packet = ''
+                    start_flag = False
+            except Exception:
+                # 어떤 예외가 나도 스레드는 살아남고, 현재 패킷만 버림
+                logger.exception('[get_serial] 처리 중 예외, 패킷 버림: {}'.format(packet))
                 packet = ''
                 start_flag = False
+                time.sleep(0.1)
             if not self.connected:
                 logger.debug('[ERROR] 서버 연결이 끊어져 get_serial Thread를 종료합니다.')
                 break
@@ -1110,381 +1185,6 @@ class Kocom(rs485):
             thermo['target_temp'] = INIT_TEMP if not init_temp else int(init_temp)
         return thermo
 
-class Grex:
-    def __init__(self, client, cont, vent):
-        self._name = 'grex'
-        self.contoller = cont
-        self.ventilator = vent
-        self.grex_cont = {'mode': 'off', 'speed': 'off'}
-        self.vent_cont = {'mode': 'off', 'speed': 'off'}
-        self.mqtt_cont = {'mode': 'off', 'speed': 'off'}
-
-        self.d_mqtt = self.connect_mqtt(client._mqtt, 'GREX')
-
-        _t4 = threading.Thread(target=self.get_serial, args=(self.contoller['serial'], self.contoller['name'], self.contoller['length']))
-        _t4.daemon = True
-        _t4.start()
-        _t5 = threading.Thread(target=self.get_serial, args=(self.ventilator['serial'], self.ventilator['name'], self.ventilator['length']))
-        _t5.daemon = True
-        _t5.start()
-
-    def connect_mqtt(self, server, name):
-        mqtt_client = mqtt.Client()
-        mqtt_client.on_message = self.on_message
-        #mqtt_client.on_publish = self.on_publish
-        mqtt_client.on_subscribe = self.on_subscribe
-        mqtt_client.on_connect = self.on_connect
-
-        if server['anonymous'] != 'True':
-            if server['server'] == '' or server['username'] == '' or server['password'] == '':
-                logger.info('{} 설정을 확인하세요. Server[{}] ID[{}] PW[{}] Device[{}]'.format(CONF_MQTT, server['server'], server['username'], server['password'], name))
-                return False
-            mqtt_client.username_pw_set(username=server['username'], password=server['password'])
-            logger.debug('{} STATUS. Server[{}] ID[{}] PW[{}] Device[{}]'.format(CONF_MQTT, server['server'], server['username'], server['password'], name))
-        else:
-            logger.debug('{} STATUS. Server[{}] Device[{}]'.format(CONF_MQTT, server['server'], name))
-
-        mqtt_client.connect(server['server'], 1883, 60)
-        mqtt_client.loop_start()
-        return mqtt_client
-
-    def on_message(self, client, obj, msg):
-        _topic = msg.topic.split('/')
-        _payload = msg.payload.decode()
-
-        if 'config' in _topic:
-            if _topic[0] == 'rs485' and _topic[3] == 'restart':
-                self.homeassistant_device_discovery()
-                return
-        elif _topic[0] == HA_PREFIX and _topic[1] == HA_FAN and _topic[2] == 'grex':
-            logger.info("Message Fan: {} = {}".format(msg.topic, _payload))
-            if _topic[3] == 'speed' or _topic[3] == 'mode':
-                if _topic[3] == 'mode' and self.mqtt_cont[_topic[3]] == 'off' and _payload == 'on' and self.mqtt_cont['speed'] == 'off':
-                    self.mqtt_cont['speed'] = 'low'
-                self.mqtt_cont[_topic[3]] = _payload
-
-                if self.mqtt_cont['mode'] == 'off' and self.mqtt_cont['speed'] == 'off':
-                    self.send_to_homeassistant(HA_FAN, self.mqtt_cont)
-
-    def on_publish(self, client, obj, mid):
-        logger.info("Publish: {}".format(str(mid)))
-
-    def on_subscribe(self, client, obj, mid, granted_qos):
-        logger.info("Subscribed: {} {}".format(str(mid),str(granted_qos)))
-
-    def on_connect(self, client, userdata, flags, rc):
-        if int(rc) == 0:
-            logger.info("MQTT connected OK")
-            self.homeassistant_device_discovery(initial=True)
-        elif int(rc) == 1:
-            logger.info("1: Connection refused – incorrect protocol version")
-        elif int(rc) == 2:
-            logger.info("2: Connection refused – invalid client identifier")
-        elif int(rc) == 3:
-            logger.info("3: Connection refused – server unavailable")
-        elif int(rc) == 4:
-            logger.info("4: Connection refused – bad username or password")
-        elif int(rc) == 5:
-            logger.info("5: Connection refused – not authorised")
-        else:
-            logger.info(rc, ": Connection refused")
-
-    def homeassistant_device_discovery(self, initial=False):
-        subscribe_list = []
-        publish_list = []
-        subscribe_list.append(('rs485/bridge/#', 0))
-        ha_topic = '{}/{}/{}_{}/config'.format(HA_PREFIX, HA_FAN, 'grex', DEVICE_FAN)
-        ha_payload = {
-            'name': '{}_{}'.format(self._name, DEVICE_FAN),
-            'cmd_t': '{}/{}/{}/mode'.format(HA_PREFIX, HA_FAN, 'grex'),
-            'stat_t': '{}/{}/{}/state'.format(HA_PREFIX, HA_FAN, 'grex'),
-            'spd_cmd_t': '{}/{}/{}/speed'.format(HA_PREFIX, HA_FAN, 'grex'),
-            'spd_stat_t': '{}/{}/{}/state'.format(HA_PREFIX, HA_FAN, 'grex'),
-            'stat_val_tpl': '{{ value_json.mode }}',
-            'spd_val_tpl': '{{ value_json.speed }}',
-            'pl_on': 'on',
-            'pl_off': 'off',
-            'spds': ['low', 'medium', 'high', 'off'],
-            'uniq_id': '{}_{}_{}'.format(self._name, 'grex', DEVICE_FAN),
-            'device': {
-                'name': 'Grex Ventilator',
-                'ids': 'grex_ventilator',
-                'mf': 'Grex',
-                'mdl': 'Ventilator',
-                'sw': SW_VERSION
-            }
-        }
-        subscribe_list.append((ha_topic, 0))
-        subscribe_list.append((ha_payload['cmd_t'], 0))
-        subscribe_list.append((ha_payload['spd_cmd_t'], 0))
-        #subscribe_list.append((ha_payload['stat_t'], 0))
-        publish_list.append({ha_topic : json.dumps(ha_payload)})
-
-        ha_topic = '{}/{}/{}_{}_mode/config'.format(HA_PREFIX, HA_SENSOR, 'grex', DEVICE_FAN)
-        ha_payload = {
-            'name': '{}_{}_mode'.format(self._name, DEVICE_FAN),
-            'stat_t': '{}/{}/{}_{}/state'.format(HA_PREFIX, HA_SENSOR, 'grex', DEVICE_FAN),
-            'val_tpl': '{{ value_json.' + DEVICE_FAN + '_mode }}',
-            'ic': 'mdi:play-circle-outline',
-            'uniq_id': '{}_{}_{}_mode'.format(self._name, 'grex', DEVICE_FAN),
-            'device': {
-                'name': 'Grex Ventilator',
-                'ids': 'grex_ventilator',
-                'mf': 'Grex',
-                'mdl': 'Ventilator',
-                'sw': SW_VERSION
-            }
-        }
-        subscribe_list.append((ha_topic, 0))
-        #subscribe_list.append((ha_payload['stat_t'], 0))
-        publish_list.append({ha_topic : json.dumps(ha_payload)})
-        ha_topic = '{}/{}/{}_{}_speed/config'.format(HA_PREFIX, HA_SENSOR, 'grex', DEVICE_FAN)
-        ha_payload = {
-            'name': '{}_{}_speed'.format(self._name, DEVICE_FAN),
-            'stat_t': '{}/{}/{}_{}/state'.format(HA_PREFIX, HA_SENSOR, 'grex', DEVICE_FAN),
-            'val_tpl': '{{ value_json.' + DEVICE_FAN + '_speed }}',
-            'ic': 'mdi:speedometer',
-            'uniq_id': '{}_{}_{}_speed'.format(self._name, 'grex', DEVICE_FAN),
-            'device': {
-                'name': 'Grex Ventilator',
-                'ids': 'grex_ventilator',
-                'mf': 'Grex',
-                'mdl': 'Ventilator',
-                'sw': SW_VERSION
-            }
-        }
-        subscribe_list.append((ha_topic, 0))
-        #subscribe_list.append((ha_payload['stat_t'], 0))
-        publish_list.append({ha_topic : json.dumps(ha_payload)})
-
-        if initial:
-            self.d_mqtt.subscribe(subscribe_list)
-        for ha in publish_list:
-            for topic, payload in ha.items():
-                self.d_mqtt.publish(topic, payload)
-
-    def send_to_homeassistant(self, target, value):
-        if target == HA_FAN:
-            self.d_mqtt.publish("{}/{}/{}/state".format(HA_PREFIX, HA_FAN, 'grex'), json.dumps(value))
-            logger.info("[To HA]{}/{}/{}/state = {}".format(HA_PREFIX, HA_FAN, 'grex', json.dumps(value)))
-        elif target == HA_SENSOR:
-            self.d_mqtt.publish("{}/{}/{}_{}/state".format(HA_PREFIX, HA_SENSOR, 'grex', DEVICE_FAN), json.dumps(value, ensure_ascii = False))
-            logger.info("[To HA]{}/{}/{}_{}/state = {}".format(HA_PREFIX, HA_SENSOR, 'grex', DEVICE_FAN, json.dumps(value, ensure_ascii = False)))
-
-    def get_serial(self, ser, packet_name, packet_len):
-        buf = []
-        start_flag = False
-        while True:
-            if ser.readable():
-                row_data = ser.read()
-                hex_d = row_data.hex()
-                start_hex = ''
-                if packet_name == 'kocom':  start_hex = 'aa'
-                elif packet_name == 'grex_ventilator':  start_hex = 'd1'
-                elif packet_name == 'grex_controller':  start_hex = 'd0'
-                if hex_d == start_hex:
-                    start_flag = True
-                if start_flag == True:
-                    buf.append(hex_d)
-
-                if len(buf) >= packet_len:
-                    joindata = ''.join(buf)
-                    chksum = self.validate_checksum(joindata, packet_len - 1)
-                    #logger.debug("[From {}]{} {} {}".format(packet_name, joindata, str(chksum[0]), str(chksum[1])))
-                    if chksum[0]:
-                        self.packet_parsing(joindata, packet_name)
-                    buf = []
-                    start_flag = False
-
-    def packet_parsing(self, packet, packet_name):
-        p_prefix = packet[:4]
-
-        if p_prefix == 'd00a':
-            m_packet = self.make_response_packet(0)
-            m_chksum = self.validate_checksum(m_packet, 11)
-            if m_chksum[0]:
-                self.contoller['serial'].write(bytearray.fromhex(m_packet))
-            logger.debug('[From Grex]error code : E1')
-        elif p_prefix == 'd08a':
-            control_packet = ''
-            response_packet = ''
-            p_mode = packet[8:12]
-            p_speed = packet[12:16]
-
-            if self.grex_cont['mode'] != GREX_MODE[p_mode] or self.grex_cont['speed'] != GREX_SPEED[p_speed]:
-                self.grex_cont['mode'] = GREX_MODE[p_mode]
-                self.grex_cont['speed'] = GREX_SPEED[p_speed]
-                logger.info('[From {}]mode:{} / speed:{}'.format(packet_name, self.grex_cont['mode'], self.grex_cont['speed']))
-                send_to_ha_fan = {'mode': 'off', 'speed': 'off'}
-                if self.grex_cont['mode'] != 'off' or (self.grex_cont['mode'] == 'off' and self.mqtt_cont['mode'] == 'on'):
-                    send_to_ha_fan['mode'] = 'on'
-                    send_to_ha_fan['speed'] = self.grex_cont['speed']
-                self.send_to_homeassistant(HA_FAN, send_to_ha_fan)
-
-                send_to_ha_sensor = {'fan_mode': 'off', 'fan_speed': 'off'}
-                if self.grex_cont['mode'] != 'off' or (self.grex_cont['mode'] == 'off' and self.mqtt_cont['mode'] == 'on'):
-                    if self.grex_cont['mode'] == 'auto':
-                        send_to_ha_sensor['fan_mode'] = '자동'
-                    elif self.grex_cont['mode'] == 'manual':
-                        send_to_ha_sensor['fan_mode'] = '수동'
-                    elif self.grex_cont['mode'] == 'sleep':
-                        send_to_ha_sensor['fan_mode'] = '취침'
-                    elif self.grex_cont['mode'] == 'off' and self.mqtt_cont['mode'] == 'on':
-                        send_to_ha_sensor['fan_mode'] = 'HA'
-                    if self.grex_cont['speed'] == 'low':
-                        send_to_ha_sensor['fan_speed'] = '1단'
-                    elif self.grex_cont['speed'] == 'medium':
-                        send_to_ha_sensor['fan_speed'] = '2단'
-                    elif self.grex_cont['speed'] == 'high':
-                        send_to_ha_sensor['fan_speed'] = '3단'
-                    elif self.grex_cont['speed'] == 'off':
-                        send_to_ha_sensor['fan_speed'] = '대기'
-                self.send_to_homeassistant(HA_SENSOR, send_to_ha_sensor)
-
-            if self.grex_cont['mode'] == 'off':
-                response_packet = self.make_response_packet(0)
-                if self.mqtt_cont['mode'] == 'off' or (self.mqtt_cont['mode'] == 'on' and self.mqtt_cont['speed'] == 'off'):
-                    control_packet = self.make_control_packet('off', 'off')
-                elif self.mqtt_cont['mode'] == 'on' and self.mqtt_cont['speed'] != 'off':
-                    control_packet = self.make_control_packet('manual', self.mqtt_cont['speed'])
-            else:
-                control_packet = self.make_control_packet(self.grex_cont['mode'], self.grex_cont['speed'])
-                if self.grex_cont['speed'] == 'low':
-                    response_packet = self.make_response_packet(1)
-                elif self.grex_cont['speed'] == 'medium':
-                    response_packet = self.make_response_packet(2)
-                elif self.grex_cont['speed'] == 'high':
-                    response_packet = self.make_response_packet(3)
-                elif self.grex_cont['speed'] == 'off':
-                    response_packet = self.make_response_packet(0)
-
-            if response_packet != '':
-                self.contoller['serial'].write(bytearray.fromhex(response_packet))
-                #logger.debug("[Tooo grex_controller]{}".format(response_packet))
-            if control_packet != '':
-                self.ventilator['serial'].write(bytearray.fromhex(control_packet))
-                #logger.debug("[Tooo grex_ventilator]{}".format(control_packet))
-
-        elif p_prefix == 'd18b':
-            p_speed = packet[8:12]
-            if self.vent_cont['speed'] != GREX_SPEED[p_speed]:
-                self.vent_cont['speed'] = GREX_SPEED[p_speed]
-                logger.info('[From {}]speed:{}'.format(packet_name, self.vent_cont['speed']))
-
-                send_to_ha_fan = {'mode': 'off', 'speed': 'off'}
-                if self.grex_cont['mode'] != 'off' or (self.grex_cont['mode'] == 'off' and self.mqtt_cont['mode'] == 'on'):
-                    send_to_ha_fan['mode'] = 'on'
-                    send_to_ha_fan['speed'] = self.vent_cont['speed']
-                self.send_to_homeassistant(HA_FAN, send_to_ha_fan)
-
-                send_to_ha_sensor = {'fan_mode': 'off', 'fan_speed': 'off'}
-                if self.grex_cont['mode'] != 'off' or (self.grex_cont['mode'] == 'off' and self.mqtt_cont['mode'] == 'on'):
-                    if self.grex_cont['mode'] == 'auto':
-                        send_to_ha_sensor['fan_mode'] = '자동'
-                    elif self.grex_cont['mode'] == 'manual':
-                        send_to_ha_sensor['fan_mode'] = '수동'
-                    elif self.grex_cont['mode'] == 'sleep':
-                        send_to_ha_sensor['fan_mode'] = '취침'
-                    elif self.grex_cont['mode'] == 'off' and self.mqtt_cont['mode'] == 'on':
-                        send_to_ha_sensor['fan_mode'] = 'HA'
-                    if self.vent_cont['speed'] == 'low':
-                        send_to_ha_sensor['fan_speed'] = '1단'
-                    elif self.vent_cont['speed'] == 'medium':
-                        send_to_ha_sensor['fan_speed'] = '2단'
-                    elif self.vent_cont['speed'] == 'high':
-                        send_to_ha_sensor['fan_speed'] = '3단'
-                    elif self.vent_cont['speed'] == 'off':
-                        send_to_ha_sensor['fan_speed'] = '대기'
-                self.send_to_homeassistant(HA_SENSOR, send_to_ha_sensor)
-
-    def make_control_packet(self, mode, speed):
-        prefix = 'd08ae022'
-        if mode == 'off':
-            packet_mode = '0000'
-        elif mode == 'auto':
-            packet_mode = '0100'
-        elif mode == 'manual':
-            packet_mode = '0200'
-        elif mode == 'sleep':
-            packet_mode = '0300'
-        else:
-            return ''
-        if speed == 'off':
-            packet_speed = '0000'
-        elif speed == 'low':
-            packet_speed = '0101'
-        elif speed == 'medium':
-            packet_speed = '0202'
-        elif speed == 'high':
-            packet_speed = '0303'
-        else:
-            return ''
-        if ((mode == 'auto' or mode == 'sleep') and (speed == 'off')) or (speed == 'low' or speed == 'medium' or speed == 'high'):
-            postfix = '0001'
-        else:
-            postfix = '0000'
-
-        packet = prefix + packet_mode + packet_speed + postfix
-        packet_checksum = self.make_checksum(packet, 10)
-        packet = packet + packet_checksum
-        return packet
-
-    def make_response_packet(self, speed):
-        prefix = 'd18be021'
-        if speed == 0:
-            packet_speed = '0000'
-        elif speed == 1:
-            packet_speed = '0101'
-        elif speed == 2:
-            packet_speed = '0202'
-        elif speed == 3:
-            packet_speed = '0303'
-        if speed == 0:
-            postfix = '0000000000'
-        elif speed > 0:
-            postfix = '0000000100'
-
-        packet = prefix + packet_speed + postfix
-        packet_checksum = self.make_checksum(packet, 11)
-        packet = packet + packet_checksum
-        return packet
-
-    def hex_to_list(self, hex_string):
-        slide_windows = 2
-        start = 0
-        buf = []
-        for x in range(int(len(hex_string) / 2)):
-            buf.append('0x{}'.format(hex_string[start: slide_windows].lower()))
-            slide_windows += 2
-            start += 2
-        return buf
-
-    def validate_checksum(self, packet, length):
-        hex_list = self.hex_to_list(packet)
-        sum_buf = 0
-        for ix, x in enumerate(hex_list):
-            if ix > 0:
-                hex_int = int(x, 16)
-                if ix == length:
-                    chksum_hex = '0x{0:02x}'.format((sum_buf % 256))
-                    if hex_list[ix] == chksum_hex:
-                        return (True, hex_list[ix])
-                    else:
-                        return (False, hex_list[ix])
-                sum_buf += hex_int
-
-    def make_checksum(self, packet, length):
-        hex_list = self.hex_to_list(packet)
-        sum_buf = 0
-        chksum_hex = 0
-        for ix, x in enumerate(hex_list):
-            if ix > 0:
-                hex_int = int(x, 16)
-                sum_buf += hex_int
-                if ix == length - 1:
-                    chksum_hex = '{0:02x}'.format((sum_buf % 256))
-        return str(chksum_hex)
-
 if __name__ == '__main__':
     #logger 인스턴스 생성 및 로그레벨 설정
     logger = logging.getLogger(CONF_LOGNAME)
@@ -1516,8 +1216,6 @@ if __name__ == '__main__':
         logger.info('[Error] DEFAULT_SPEED 설정오류로 medium 으로 설정. {} -> medium'.format(DEFAULT_SPEED))
         DEFAULT_SPEED = 'medium'
 
-    _grex_ventilator = False
-    _grex_controller = False
     connection_flag = False
     while not connection_flag:
         r = rs485()
@@ -1530,10 +1228,6 @@ if __name__ == '__main__':
                         logger.info('[CONFIG] {} 초기화'.format(_name))
                         if _name == 'kocom':
                             kocom = Kocom(r, _name, device, 42)
-                        elif _name == 'grex_ventilator':
-                            _grex_ventilator = {'serial': r._connect[device], 'name': _name, 'length': 12}
-                        elif _name == 'grex_controller':
-                            _grex_controller = {'serial': r._connect[device], 'name': _name, 'length': 11}
                     except:
                         logger.info('[CONFIG] {} 초기화 실패'.format(_name))
         elif r._type == 'socket':
@@ -1544,6 +1238,4 @@ if __name__ == '__main__':
                     logger.info('[ERROR] 서버 연결이 끊어져 1분 후 재접속을 시도합니다.')
                     time.sleep(60)
                     connection_flag = False
-        if _grex_ventilator is not False and _grex_controller is not False:
-            _grex = Grex(r, _grex_controller, _grex_ventilator)
             
