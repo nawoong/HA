@@ -37,7 +37,7 @@ try:
 except ImportError:  # 소켓만 쓰는 경우 pyserial 없어도 동작
     serial = None
 
-SW_VERSION = 'RS485 Compilation 1.2.1'
+SW_VERSION = 'RS485 Compilation 1.2.2'
 
 ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
 OPTIONS_FILE = '/data/options.json'
